@@ -1,0 +1,36 @@
+name: base-execution-engine
+
+services:
+  engine:
+    build: .
+    container_name: base-execution-engine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ENGINE_MODE: ${ENGINE_MODE:-research}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      BASE_CHAIN_ID: ${BASE_CHAIN_ID:-8453}
+      BASE_IPC_PATH: ${BASE_IPC_PATH:-/app/node-data/geth.ipc}
+      FLASHBLOCKS_WS_URL: ${FLASHBLOCKS_WS_URL:-wss://mainnet-preconf.base.org}
+      MAX_ROUTE_HOPS: ${MAX_ROUTE_HOPS:-3}
+      MAX_CANDIDATE_ROUTES: ${MAX_CANDIDATE_ROUTES:-16}
+      FLASHBLOCKS_SUBSCRIBE_TRANSACTIONS: ${FLASHBLOCKS_SUBSCRIBE_TRANSACTIONS:-true}
+      FLASHBLOCKS_SUBSCRIBE_PENDING_LOGS: ${FLASHBLOCKS_SUBSCRIBE_PENDING_LOGS:-true}
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    network_mode: "host"
+
+    volumes:
+      - ${BASE_NODE_DATA_DIR:-/home/ubuntu/node/data/geth}:/app/node-data

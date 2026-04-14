@@ -1,0 +1,11 @@
+[package]
+name = "simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+common = { path = "../common" }
+ethers.workspace = true
+strategy = { path = "../strategy" }
