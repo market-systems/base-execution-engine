@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use common::{PoolEdge, RoutePlan, RouteStep, VenueKind};
+use common::{default_capabilities_for_venue, PoolEdge, RoutePlan, RouteStep, VenueKind};
 use ethers::types::{Address, U256};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -49,6 +49,39 @@ impl LiquidityGraph {
             source,
             target,
             amount_in,
+            amount_in,
+            max_hops,
+            &mut visited,
+            &mut steps,
+            &mut results,
+        );
+
+        results.sort_by(|left, right| {
+            right
+                .expected_amount_out
+                .cmp(&left.expected_amount_out)
+                .then_with(|| left.estimated_gas.cmp(&right.estimated_gas))
+        });
+        results.truncate(max_candidates);
+        results
+    }
+
+    pub fn plan_cycles(
+        &self,
+        settlement_token: Address,
+        amount_in: U256,
+        max_hops: usize,
+        max_candidates: usize,
+    ) -> Vec<RoutePlan> {
+        let mut results = Vec::new();
+        let mut visited = HashSet::from([settlement_token]);
+        let mut steps = Vec::<RouteStep>::new();
+
+        self.search_cycles(
+            settlement_token,
+            settlement_token,
+            amount_in,
+            amount_in,
             max_hops,
             &mut visited,
             &mut steps,
@@ -69,6 +102,7 @@ impl LiquidityGraph {
         &self,
         current: Address,
         target: Address,
+        initial_amount: U256,
         amount: U256,
         remaining_hops: usize,
         visited: &mut HashSet<Address>,
@@ -81,6 +115,10 @@ impl LiquidityGraph {
 
         if let Some(edges) = self.adjacency.get(&current) {
             for edge in edges {
+                if !edge.capabilities.plannable {
+                    continue;
+                }
+
                 if visited.contains(&edge.token_out) {
                     continue;
                 }
@@ -96,7 +134,7 @@ impl LiquidityGraph {
                     results.push(RoutePlan {
                         source_token: current_steps.first().map(|step| step.token_in).unwrap_or(current),
                         target_token: target,
-                        amount_in: amount,
+                        amount_in: initial_amount,
                         steps: current_steps.clone(),
                         expected_amount_out: projected_amount,
                         estimated_gas,
@@ -106,6 +144,69 @@ impl LiquidityGraph {
                     self.search(
                         edge.token_out,
                         target,
+                        initial_amount,
+                        projected_amount,
+                        remaining_hops - 1,
+                        visited,
+                        current_steps,
+                        results,
+                    );
+                    visited.remove(&edge.token_out);
+                }
+
+                current_steps.pop();
+            }
+        }
+    }
+
+    fn search_cycles(
+        &self,
+        settlement_token: Address,
+        current: Address,
+        initial_amount: U256,
+        amount: U256,
+        remaining_hops: usize,
+        visited: &mut HashSet<Address>,
+        current_steps: &mut Vec<RouteStep>,
+        results: &mut Vec<RoutePlan>,
+    ) {
+        if remaining_hops == 0 {
+            return;
+        }
+
+        if let Some(edges) = self.adjacency.get(&current) {
+            for edge in edges {
+                if !edge.capabilities.plannable {
+                    continue;
+                }
+
+                let closes_cycle = edge.token_out == settlement_token && !current_steps.is_empty();
+                if visited.contains(&edge.token_out) && !closes_cycle {
+                    continue;
+                }
+
+                let projected_amount = apply_step_fee(amount, edge.fee_bps);
+                current_steps.push(RouteStep::from(edge));
+
+                if closes_cycle {
+                    let estimated_gas = current_steps
+                        .iter()
+                        .map(|step| step.estimated_gas)
+                        .sum::<u64>();
+                    results.push(RoutePlan {
+                        source_token: settlement_token,
+                        target_token: settlement_token,
+                        amount_in: initial_amount,
+                        steps: current_steps.clone(),
+                        expected_amount_out: projected_amount,
+                        estimated_gas,
+                    });
+                } else {
+                    visited.insert(edge.token_out);
+                    self.search_cycles(
+                        settlement_token,
+                        edge.token_out,
+                        initial_amount,
                         projected_amount,
                         remaining_hops - 1,
                         visited,
@@ -140,6 +241,7 @@ impl SeedPoolEntry {
         Ok(PoolEdge {
             name: self.name,
             venue: parse_venue(&self.venue)?,
+            capabilities: default_capabilities_for_venue(parse_venue(&self.venue)?),
             router: parse_address(&self.router)?,
             quoter: self.quoter.as_deref().map(parse_address).transpose()?,
             token_in: parse_address(&self.token_in)?,
@@ -162,7 +264,7 @@ pub fn load_seed_graph(path: &str) -> Result<LiquidityGraph> {
 
     let mut graph = LiquidityGraph::default();
     for entry in entries {
-        graph.add_edge(entry.into_pool_edge()?);
+        graph.add_bidirectional_edge(entry.into_pool_edge()?);
     }
 
     Ok(graph)
@@ -203,6 +305,7 @@ mod tests {
         graph.add_edge(PoolEdge {
             name: "WETH-USDC".to_string(),
             venue: VenueKind::UniswapV3,
+            capabilities: default_capabilities_for_venue(VenueKind::UniswapV3),
             router: address(10),
             quoter: Some(address(11)),
             token_in: address(1),
@@ -217,6 +320,7 @@ mod tests {
         graph.add_edge(PoolEdge {
             name: "USDC-TOKEN".to_string(),
             venue: VenueKind::AerodromeV2,
+            capabilities: default_capabilities_for_venue(VenueKind::AerodromeV2),
             router: address(12),
             quoter: Some(address(13)),
             token_in: address(2),

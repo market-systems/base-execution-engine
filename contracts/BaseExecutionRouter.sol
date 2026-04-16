@@ -41,9 +41,10 @@ contract BaseExecutionRouter is Ownable, Pausable {
     }
 
     struct ExecutionPlan {
-        address fundingToken;
-        uint256 amountIn;
-        uint256 minAmountOut;
+        address settlementToken;
+        uint256 fundingAmount;
+        uint256 minRepayAmount;
+        uint256 minSurplus;
         RouteStep[] steps;
         bytes32 riskHash;
     }
@@ -53,15 +54,15 @@ contract BaseExecutionRouter is Ownable, Pausable {
     event ExecutorUpdated(address indexed executor, bool allowed);
     event PlanExecuted(
         address indexed caller,
-        address indexed fundingToken,
-        uint256 amountIn,
+        address indexed settlementToken,
+        uint256 fundingAmount,
         uint256 amountOut,
         bytes32 riskHash
     );
 
     error ExecutorNotAuthorized();
     error UnsupportedVenue();
-    error InsufficientOutput(uint256 actualAmountOut, uint256 minimumAmountOut);
+    error InsufficientSettlement(uint256 actualAmountOut, uint256 minimumAmountOut);
 
     modifier onlyExecutor() {
         if (!executors[msg.sender] && msg.sender != owner()) {
@@ -88,14 +89,14 @@ contract BaseExecutionRouter is Ownable, Pausable {
     function executePlan(
         ExecutionPlan calldata plan
     ) external payable onlyExecutor whenNotPaused returns (uint256 amountOut) {
-        IERC20(plan.fundingToken).safeTransferFrom(
+        IERC20(plan.settlementToken).safeTransferFrom(
             msg.sender,
             address(this),
-            plan.amountIn
+            plan.fundingAmount
         );
 
-        uint256 currentAmount = plan.amountIn;
-        address currentToken = plan.fundingToken;
+        uint256 currentAmount = plan.fundingAmount;
+        address currentToken = plan.settlementToken;
 
         for (uint256 index = 0; index < plan.steps.length; index++) {
             RouteStep calldata step = plan.steps[index];
@@ -127,15 +128,20 @@ contract BaseExecutionRouter is Ownable, Pausable {
         }
 
         amountOut = currentAmount;
-        if (amountOut < plan.minAmountOut) {
-            revert InsufficientOutput(amountOut, plan.minAmountOut);
+        if (currentToken != plan.settlementToken) {
+            revert UnsupportedVenue();
+        }
+
+        uint256 minimumSettlement = plan.minRepayAmount + plan.minSurplus;
+        if (amountOut < minimumSettlement) {
+            revert InsufficientSettlement(amountOut, minimumSettlement);
         }
 
         IERC20(currentToken).safeTransfer(msg.sender, amountOut);
         emit PlanExecuted(
             msg.sender,
-            plan.fundingToken,
-            plan.amountIn,
+            plan.settlementToken,
+            plan.fundingAmount,
             amountOut,
             plan.riskHash
         );

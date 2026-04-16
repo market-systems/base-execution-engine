@@ -9,9 +9,13 @@ anyhow.workspace = true
 common = { path = "../common" }
 config = { path = "../config" }
 decode = { path = "../decode" }
+execution = { path = "../execution" }
 graph = { path = "../graph" }
 ingress = { path = "../ingress" }
+policy = { path = "../policy" }
+reconcile = { path = "../reconcile" }
 simulation = { path = "../simulation" }
+state = { path = "../state" }
 strategy = { path = "../strategy" }
 ethers.workspace = true
 tokio.workspace = true

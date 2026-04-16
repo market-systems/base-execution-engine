@@ -11,7 +11,10 @@ services:
       ENGINE_MODE: ${ENGINE_MODE:-research}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       BASE_CHAIN_ID: ${BASE_CHAIN_ID:-8453}
+      BASE_TRANSPORT: ${BASE_TRANSPORT:-ipc}
       BASE_IPC_PATH: ${BASE_IPC_PATH:-/app/node-data/geth.ipc}
+      BASE_RPC_URL: ${BASE_RPC_URL:-}
+      BASE_WS_URL: ${BASE_WS_URL:-}
       FLASHBLOCKS_WS_URL: ${FLASHBLOCKS_WS_URL:-wss://mainnet-preconf.base.org}
       MAX_ROUTE_HOPS: ${MAX_ROUTE_HOPS:-3}
       MAX_CANDIDATE_ROUTES: ${MAX_CANDIDATE_ROUTES:-16}

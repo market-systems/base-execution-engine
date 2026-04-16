@@ -1,5 +1,5 @@
 [package]
-name = "simulation"
+name = "orchestrator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,5 +8,4 @@ license.workspace = true
 anyhow.workspace = true
 common = { path = "../common" }
 ethers.workspace = true
-ingress = { path = "../ingress" }
-strategy = { path = "../strategy" }
+state = { path = "../state" }

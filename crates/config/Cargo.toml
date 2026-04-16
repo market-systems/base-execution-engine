@@ -9,3 +9,4 @@ anyhow.workspace = true
 common = { path = "../common" }
 dotenv.workspace = true
 serde.workspace = true
+ethers.workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "simulation"
+name = "execution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,6 @@ anyhow.workspace = true
 common = { path = "../common" }
 ethers.workspace = true
 ingress = { path = "../ingress" }
+serde_json.workspace = true
 strategy = { path = "../strategy" }
+async-trait = "0.1"

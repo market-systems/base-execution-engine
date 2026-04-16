@@ -53,9 +53,13 @@ dependencies = [
  "config",
  "decode",
  "ethers",
+ "execution",
  "graph",
  "ingress",
+ "policy",
+ "reconcile",
  "simulation",
+ "state",
  "strategy",
  "tokio",
  "tracing",
@@ -389,6 +393,7 @@ dependencies = [
  "anyhow",
  "common",
  "dotenv",
+ "ethers",
  "serde",
 ]
 
@@ -1073,6 +1078,19 @@ dependencies = [
  "tracing",
  "walkdir",
  "yansi",
+]
+
+[[package]]
+name = "execution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "common",
+ "ethers",
+ "ingress",
+ "serde_json",
+ "strategy",
 ]
 
 [[package]]
@@ -2028,6 +2046,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "ethers",
+ "state",
+]
+
+[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2243,6 +2271,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "policy"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "ethers",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2436,6 +2472,17 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "reconcile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "ethers",
+ "ingress",
+ "state",
 ]
 
 [[package]]
@@ -2963,6 +3010,7 @@ dependencies = [
  "anyhow",
  "common",
  "ethers",
+ "ingress",
  "strategy",
 ]
 
@@ -3039,6 +3087,17 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "ethers",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "static_assertions"

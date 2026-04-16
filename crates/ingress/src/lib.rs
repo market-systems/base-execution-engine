@@ -1,8 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use common::{EventSource, IngressEvent, RawTransactionEnvelope};
-use config::FlashblocksConfig;
-use ethers::providers::{Ipc, Middleware, Provider};
-use ethers::types::{Address, Bytes, H256, U256};
+use config::{BaseNetworkConfig, ChainTransportKind, FlashblocksConfig};
+use ethers::{
+    middleware::SignerMiddleware,
+    providers::{Http, Ipc, Middleware, Provider, Ws},
+    signers::{LocalWallet, Signer},
+    types::{
+        transaction::eip2718::TypedTransaction, Address, BlockId, Bytes, H256, Transaction,
+        TransactionReceipt, U256,
+    },
+};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{str::FromStr, sync::Arc};
@@ -10,31 +17,286 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone)]
+enum ReadProvider {
+    Ipc(Arc<Provider<Ipc>>),
+    Http(Arc<Provider<Http>>),
+    Ws(Arc<Provider<Ws>>),
+}
+
+#[derive(Debug, Clone)]
+enum WriteProvider {
+    Ipc(Arc<SignerMiddleware<Provider<Ipc>, LocalWallet>>),
+    Http(Arc<SignerMiddleware<Provider<Http>, LocalWallet>>),
+    Ws(Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>),
+}
+
+#[derive(Debug, Clone)]
 pub struct ChainClient {
-    provider: Arc<Provider<Ipc>>,
+    transport: ChainTransportKind,
+    reader: ReadProvider,
+    writer: Option<WriteProvider>,
 }
 
 impl ChainClient {
-    pub async fn connect(ipc_path: &str) -> Result<Self> {
-        let provider = Provider::<Ipc>::connect_ipc(ipc_path)
-            .await
-            .with_context(|| format!("failed to connect to local IPC at {ipc_path}"))?;
+    pub async fn connect(config: &BaseNetworkConfig) -> Result<Self> {
+        match Self::resolve_transport(config)? {
+            ChainTransportKind::Ipc => {
+                let ipc_path = config
+                    .ipc_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("BASE_IPC_PATH must be set for ipc transport"))?;
+                let provider = Provider::<Ipc>::connect_ipc(ipc_path)
+                    .await
+                    .with_context(|| format!("failed to connect to local IPC at {ipc_path}"))?;
+                Ok(Self {
+                    transport: ChainTransportKind::Ipc,
+                    reader: ReadProvider::Ipc(Arc::new(provider)),
+                    writer: None,
+                })
+            }
+            ChainTransportKind::Http => {
+                let rpc_url = config
+                    .rpc_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("BASE_RPC_URL must be set for http transport"))?;
+                let provider = Provider::<Http>::try_from(rpc_url)
+                    .with_context(|| format!("failed to connect to HTTP RPC at {rpc_url}"))?;
+                Ok(Self {
+                    transport: ChainTransportKind::Http,
+                    reader: ReadProvider::Http(Arc::new(provider)),
+                    writer: None,
+                })
+            }
+            ChainTransportKind::Ws => {
+                let ws_url = config
+                    .ws_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("BASE_WS_URL must be set for ws transport"))?;
+                let provider = Provider::<Ws>::connect(ws_url)
+                    .await
+                    .with_context(|| format!("failed to connect to websocket RPC at {ws_url}"))?;
+                Ok(Self {
+                    transport: ChainTransportKind::Ws,
+                    reader: ReadProvider::Ws(Arc::new(provider)),
+                    writer: None,
+                })
+            }
+            ChainTransportKind::Auto => Err(anyhow!("auto transport should be resolved before connect")),
+        }
+    }
+
+    pub fn with_signer(&self, executor_private_key: &str, chain_id: u64) -> Result<Self> {
+        let wallet = executor_private_key
+            .parse::<LocalWallet>()
+            .context("failed to parse EXECUTOR_PRIVATE_KEY")?
+            .with_chain_id(chain_id);
+
+        let writer = match &self.reader {
+            ReadProvider::Ipc(provider) => {
+                WriteProvider::Ipc(Arc::new(SignerMiddleware::new((**provider).clone(), wallet)))
+            }
+            ReadProvider::Http(provider) => {
+                WriteProvider::Http(Arc::new(SignerMiddleware::new((**provider).clone(), wallet)))
+            }
+            ReadProvider::Ws(provider) => {
+                WriteProvider::Ws(Arc::new(SignerMiddleware::new((**provider).clone(), wallet)))
+            }
+        };
+
         Ok(Self {
-            provider: Arc::new(provider),
+            transport: self.transport,
+            reader: self.reader.clone(),
+            writer: Some(writer),
         })
     }
 
-    pub fn provider(&self) -> Arc<Provider<Ipc>> {
-        Arc::clone(&self.provider)
+    pub fn transport(&self) -> ChainTransportKind {
+        self.transport
+    }
+
+    pub fn signer_address(&self) -> Option<Address> {
+        match &self.writer {
+            Some(WriteProvider::Ipc(client)) => Some(client.address()),
+            Some(WriteProvider::Http(client)) => Some(client.address()),
+            Some(WriteProvider::Ws(client)) => Some(client.address()),
+            None => None,
+        }
     }
 
     pub async fn health_check(&self) -> Result<u64> {
-        let block_number = self
-            .provider
-            .get_block_number()
-            .await
-            .context("failed to fetch the latest Base block number")?;
-        Ok(block_number.as_u64())
+        Ok(self.get_block_number().await?.as_u64())
+    }
+
+    pub async fn get_block_number(&self) -> Result<ethers::types::U64> {
+        match &self.reader {
+            ReadProvider::Ipc(provider) => provider
+                .get_block_number()
+                .await
+                .context("failed to fetch the latest Base block number"),
+            ReadProvider::Http(provider) => provider
+                .get_block_number()
+                .await
+                .context("failed to fetch the latest Base block number"),
+            ReadProvider::Ws(provider) => provider
+                .get_block_number()
+                .await
+                .context("failed to fetch the latest Base block number"),
+        }
+    }
+
+    pub async fn call(&self, tx: &TypedTransaction) -> Result<Bytes> {
+        match &self.reader {
+            ReadProvider::Ipc(provider) => provider.call(tx, None).await.context("eth_call failed"),
+            ReadProvider::Http(provider) => provider.call(tx, None).await.context("eth_call failed"),
+            ReadProvider::Ws(provider) => provider.call(tx, None).await.context("eth_call failed"),
+        }
+    }
+
+    pub async fn get_transaction(&self, tx_hash: H256) -> Result<Option<Transaction>> {
+        match &self.reader {
+            ReadProvider::Ipc(provider) => provider
+                .get_transaction(tx_hash)
+                .await
+                .with_context(|| format!("failed to fetch transaction {tx_hash:?}")),
+            ReadProvider::Http(provider) => provider
+                .get_transaction(tx_hash)
+                .await
+                .with_context(|| format!("failed to fetch transaction {tx_hash:?}")),
+            ReadProvider::Ws(provider) => provider
+                .get_transaction(tx_hash)
+                .await
+                .with_context(|| format!("failed to fetch transaction {tx_hash:?}")),
+        }
+    }
+
+    pub async fn get_transaction_receipt(
+        &self,
+        tx_hash: H256,
+    ) -> Result<Option<TransactionReceipt>> {
+        match &self.reader {
+            ReadProvider::Ipc(provider) => provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .with_context(|| format!("failed to fetch receipt for {tx_hash:?}")),
+            ReadProvider::Http(provider) => provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .with_context(|| format!("failed to fetch receipt for {tx_hash:?}")),
+            ReadProvider::Ws(provider) => provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .with_context(|| format!("failed to fetch receipt for {tx_hash:?}")),
+        }
+    }
+
+    pub async fn get_transaction_count(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<U256> {
+        match &self.reader {
+            ReadProvider::Ipc(provider) => provider
+                .get_transaction_count(address, block)
+                .await
+                .with_context(|| format!("failed to fetch nonce for {address:?}")),
+            ReadProvider::Http(provider) => provider
+                .get_transaction_count(address, block)
+                .await
+                .with_context(|| format!("failed to fetch nonce for {address:?}")),
+            ReadProvider::Ws(provider) => provider
+                .get_transaction_count(address, block)
+                .await
+                .with_context(|| format!("failed to fetch nonce for {address:?}")),
+        }
+    }
+
+    pub async fn get_gas_price(&self) -> Result<U256> {
+        match &self.reader {
+            ReadProvider::Ipc(provider) => provider
+                .get_gas_price()
+                .await
+                .context("failed to fetch current gas price"),
+            ReadProvider::Http(provider) => provider
+                .get_gas_price()
+                .await
+                .context("failed to fetch current gas price"),
+            ReadProvider::Ws(provider) => provider
+                .get_gas_price()
+                .await
+                .context("failed to fetch current gas price"),
+        }
+    }
+
+    pub async fn call_many(&self, txs: &[TypedTransaction]) -> Result<Vec<Bytes>> {
+        let calls = txs
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to serialize transaction sequence for post-trigger simulation")?;
+
+        let result = match &self.reader {
+            ReadProvider::Ipc(provider) => request_call_many_ipc(provider.as_ref(), &calls).await,
+            ReadProvider::Http(provider) => request_call_many_http(provider.as_ref(), &calls).await,
+            ReadProvider::Ws(provider) => request_call_many_ws(provider.as_ref(), &calls).await,
+        }?;
+
+        parse_call_many_response(result)
+    }
+
+    pub async fn send_transaction(&self, tx: TypedTransaction) -> Result<H256> {
+        match &self.writer {
+            Some(WriteProvider::Ipc(client)) => Ok(client
+                .send_transaction(tx, None)
+                .await
+                .context("failed to submit signed transaction")?
+                .tx_hash()),
+            Some(WriteProvider::Http(client)) => Ok(client
+                .send_transaction(tx, None)
+                .await
+                .context("failed to submit signed transaction")?
+                .tx_hash()),
+            Some(WriteProvider::Ws(client)) => Ok(client
+                .send_transaction(tx, None)
+                .await
+                .context("failed to submit signed transaction")?
+                .tx_hash()),
+            None => Err(anyhow!("chain client is not configured with a signer")),
+        }
+    }
+
+    fn resolve_transport(config: &BaseNetworkConfig) -> Result<ChainTransportKind> {
+        match config.transport {
+            ChainTransportKind::Auto => {
+                if config
+                    .ipc_path
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some()
+                {
+                    Ok(ChainTransportKind::Ipc)
+                } else if config
+                    .ws_url
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some()
+                {
+                    Ok(ChainTransportKind::Ws)
+                } else if config
+                    .rpc_url
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some()
+                {
+                    Ok(ChainTransportKind::Http)
+                } else {
+                    Err(anyhow!(
+                        "BASE_TRANSPORT=auto requires at least one configured network endpoint"
+                    ))
+                }
+            }
+            transport => Ok(transport),
+        }
     }
 }
 
@@ -218,4 +480,91 @@ fn parse_u64_quantity(value: &str) -> Option<u64> {
     } else {
         value.parse::<u64>().ok()
     }
+}
+
+async fn request_call_many_ipc(provider: &Provider<Ipc>, calls: &[Value]) -> Result<Value> {
+    request_call_many_impl(provider, calls).await
+}
+
+async fn request_call_many_http(provider: &Provider<Http>, calls: &[Value]) -> Result<Value> {
+    request_call_many_impl(provider, calls).await
+}
+
+async fn request_call_many_ws(provider: &Provider<Ws>, calls: &[Value]) -> Result<Value> {
+    request_call_many_impl(provider, calls).await
+}
+
+async fn request_call_many_impl<P>(provider: &Provider<P>, calls: &[Value]) -> Result<Value>
+where
+    P: ethers::providers::JsonRpcClient,
+{
+    let attempts = [
+        ("eth_callMany", json!([calls, "pending"])),
+        (
+            "eth_simulateV1",
+            json!([{
+                "blockStateCalls": [{
+                    "calls": calls,
+                }],
+                "validation": true,
+                "traceTransfers": false
+            }]),
+        ),
+    ];
+
+    let mut last_error = None;
+    for (method, params) in attempts {
+        match provider.request::<Value, Value>(method, params).await {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(anyhow!("{method} failed: {error}")),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("no supported post-trigger simulation RPC method")))
+}
+
+fn parse_call_many_response(value: Value) -> Result<Vec<Bytes>> {
+    let calls = value
+        .get("calls")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+        .ok_or_else(|| anyhow!("unexpected post-trigger simulation response shape"))?;
+
+    let mut outputs = Vec::new();
+    for entry in calls {
+        if let Some(inner_calls) = entry.get("calls").and_then(Value::as_array) {
+            for call in inner_calls {
+                if let Some(bytes) = parse_call_output(call) {
+                    outputs.push(bytes);
+                }
+            }
+            continue;
+        }
+
+        if let Some(bytes) = parse_call_output(entry) {
+            outputs.push(bytes);
+        }
+    }
+
+    if outputs.is_empty() {
+        return Err(anyhow!(
+            "post-trigger simulation response did not contain callable outputs"
+        ));
+    }
+
+    Ok(outputs)
+}
+
+fn parse_call_output(value: &Value) -> Option<Bytes> {
+    if let Some(raw) = value.as_str() {
+        return parse_bytes(raw);
+    }
+
+    for key in ["value", "output", "returnData"] {
+        if let Some(raw) = value.get(key).and_then(Value::as_str) {
+            return parse_bytes(raw);
+        }
+    }
+
+    None
 }

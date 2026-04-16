@@ -28,6 +28,7 @@ impl IntentDecoder {
             source: envelope.source,
             tx_hash: envelope.tx_hash,
             actor: envelope.from,
+            router: to,
             venue: if venue == VenueKind::Unknown && pool_key.is_some() {
                 VenueKind::UniswapV4
             } else {
@@ -38,6 +39,8 @@ impl IntentDecoder {
             token_out,
             amount_in,
             pool_key,
+            input: envelope.input.clone(),
+            value: envelope.value,
             raw_selector,
             metadata: json!({
                 "router_name": router_name(&to),

@@ -38,43 +38,79 @@ docs/
 ## Runtime Modes
 
 - `research`: ingress, decoding, planning, and simulation only
-- `shadow`: full decision pipeline without broadcasting
-- `live`: guarded execution path
+- `shadow`: full execution pipeline with request construction, but broadcasting is suppressed
+- `live`: full execution pipeline with real broadcasting enabled
 
 ## Configuration
 
 Key environment variables:
 
 - `ENGINE_MODE`
+- `BASE_TRANSPORT`
 - `BASE_IPC_PATH`
+- `BASE_RPC_URL`
+- `BASE_WS_URL`
 - `FLASHBLOCKS_WS_URL`
 - `BASE_CHAIN_ID`
 - `LOG_LEVEL`
 - `MAX_ROUTE_HOPS`
 - `MAX_CANDIDATE_ROUTES`
+- `SETTLEMENT_TOKENS`
+- `MIN_NET_SURPLUS`
+- `MIN_OUTPUT_BPS`
+- `POST_TRIGGER_ONLY`
+- `EXECUTION_ROUTER_ADDRESS`
 - `FLASHBLOCKS_SUBSCRIBE_TRANSACTIONS`
 - `FLASHBLOCKS_SUBSCRIBE_PENDING_LOGS`
 - `LIQUIDITY_SEEDS_PATH`
+- `STATE_DIR`
+- `EXECUTOR_PRIVATE_KEY`
+- `RECONCILE_INTERVAL_SECS`
+- `SUBMISSION_TIMEOUT_SECS`
 
 Static liquidity seed data can be stored in
 [config/base-liquidity-seeds.example.json](/Users/wenyiyu/wenyi/rust-arbitrage-searcher/config/base-liquidity-seeds.example.json:1).
+
+## Base Node Notes
+
+- This runtime assumes the Base node is the canonical read and simulation backend.
+- Do not assume every Base full node exposes the same advanced simulation RPCs.
+  Support for ordered replay methods such as `eth_simulateV1` or `eth_callMany`
+  depends on the actual Base execution client, client version, and RPC exposure
+  settings.
+- In `shadow` and `live`, the engine defaults to `POST_TRIGGER_ONLY=true`.
+  That means opportunities are rejected unless the runtime can confirm a
+  post-trigger replay path instead of falling back to current-state-only quotes.
+- Trigger-aware replay should be verified against the exact node you run in
+  production. A self-hosted node may still lack the RPC methods required for
+  ordered transaction simulation.
+- Keep the planner and the node environment aligned: if the node cannot support
+  the replay path needed for a mode, treat that as a deployment constraint, not
+  as something to bypass in policy.
 
 ## Current Status
 
 The current workspace currently includes:
 
 - Flashblocks websocket ingress scaffolding
-- Local Base IPC connectivity
+- Transport-agnostic Base connectivity over IPC, HTTP, or websocket RPC
 - Canonical transaction and intent models
 - Multi-protocol calldata decoding
-- Liquidity graph primitives and bounded route planning
+- Liquidity graph primitives and bounded cycle planning
 - Venue-specific quote and swap adapters
-- Quote-driven route simulation
-- A guarded execution contract interface
+- Settlement-aware route simulation with trigger preflight and optional
+  post-trigger replay
+- Router-shaped execution requests and guarded contract submission
 
 The current implementation is intentionally focused on architecture, module
 boundaries, and runtime composition. Full policy, durable state, and expanded
 execution support are tracked in the design document.
+
+## Future Implementation Notes
+
+- The latency-critical path is `decode -> plan -> simulate -> policy -> build execution request -> dispatch`.
+- The current design intentionally avoids a mandatory synchronous database write between request construction and dispatch.
+- If we later need stronger crash recovery before dispatch, the preferred intermediate implementation is a very lightweight in-memory journal, WAL, or ring-buffer record rather than a full blocking database write in the hot path.
 
 ## Implemented Components
 
@@ -94,20 +130,22 @@ execution support are tracked in the design document.
 
 ### Planning
 
-- Token-to-token adjacency graph
-- Bounded route search with cycle avoidance
-- Candidate ranking by projected output and gas
+- Token adjacency graph
+- Bounded cycle search from configured settlement tokens
+- Candidate ranking by simulated net surplus
 
 ### Simulation
 
 - Sequential quote simulation over local chain state
-- Route-level projected output and gas aggregation
+- Trigger preflight checks using observed calldata
+- Optional post-trigger replay when the node exposes ordered simulation RPCs
+- Route-level projected output, gas cost, and net surplus aggregation
 
 ### Contracts
 
 - `BaseExecutionRouter` with executor authorization
 - Pause controls
-- Minimum output enforcement
+- Settlement-token repayment and minimum surplus enforcement
 - Structured execution events
 
 ## Development

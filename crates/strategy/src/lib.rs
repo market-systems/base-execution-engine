@@ -2,9 +2,10 @@
 
 use anyhow::{anyhow, Result};
 use common::{
-    ContractCall, PoolKey, RouteStep, VenueKind, AERODROME_FACTORY, AERODROME_ROUTER,
-    CLANKER_HOOK_DYNAMIC, CLANKER_HOOK_STATIC, PANCAKESWAP_V3_QUOTER, PANCAKESWAP_V3_ROUTER,
-    UNIV3_QUOTER, UNIV3_ROUTER, UNIV4_QUOTER, UNIVERSAL_ROUTER, WETH_BASE,
+    default_capabilities_for_venue, ContractCall, PoolKey, RouteStep, VenueKind,
+    AERODROME_FACTORY, AERODROME_ROUTER, CLANKER_HOOK_DYNAMIC, CLANKER_HOOK_STATIC,
+    PANCAKESWAP_V3_QUOTER, PANCAKESWAP_V3_ROUTER, UNIV3_QUOTER, UNIV3_ROUTER, UNIV4_QUOTER,
+    UNIVERSAL_ROUTER, WETH_BASE,
 };
 use ethers::abi::{Abi, Function, Param, ParamType, StateMutability, Token as AbiToken, Tokenizable};
 use ethers::prelude::*;
@@ -79,6 +80,7 @@ pub fn default_quote_steps(token: Address, pool_key: Option<PoolKey>) -> Vec<Rou
         RouteStep {
             venue: VenueKind::UniswapV3,
             name: "UniswapV3 1%".to_string(),
+            capabilities: default_capabilities_for_venue(VenueKind::UniswapV3),
             router: *UNIV3_ROUTER,
             quoter: Some(*UNIV3_QUOTER),
             token_in: *WETH_BASE,
@@ -92,6 +94,7 @@ pub fn default_quote_steps(token: Address, pool_key: Option<PoolKey>) -> Vec<Rou
         RouteStep {
             venue: VenueKind::UniswapV3,
             name: "PancakeSwapV3".to_string(),
+            capabilities: default_capabilities_for_venue(VenueKind::UniswapV3),
             router: *PANCAKESWAP_V3_ROUTER,
             quoter: Some(*PANCAKESWAP_V3_QUOTER),
             token_in: *WETH_BASE,
@@ -105,6 +108,7 @@ pub fn default_quote_steps(token: Address, pool_key: Option<PoolKey>) -> Vec<Rou
         RouteStep {
             venue: VenueKind::AerodromeV2,
             name: "Aerodrome V2".to_string(),
+            capabilities: default_capabilities_for_venue(VenueKind::AerodromeV2),
             router: *AERODROME_ROUTER,
             quoter: Some(*AERODROME_ROUTER),
             token_in: *WETH_BASE,
@@ -121,6 +125,7 @@ pub fn default_quote_steps(token: Address, pool_key: Option<PoolKey>) -> Vec<Rou
         steps.push(RouteStep {
             venue: VenueKind::UniswapV4,
             name: "Extracted V4".to_string(),
+            capabilities: default_capabilities_for_venue(VenueKind::UniswapV4),
             router: *UNIVERSAL_ROUTER,
             quoter: Some(*UNIV4_QUOTER),
             token_in: *WETH_BASE,
@@ -135,6 +140,7 @@ pub fn default_quote_steps(token: Address, pool_key: Option<PoolKey>) -> Vec<Rou
         steps.push(RouteStep {
             venue: VenueKind::UniswapV4,
             name: "Clanker Static".to_string(),
+            capabilities: default_capabilities_for_venue(VenueKind::UniswapV4),
             router: *UNIVERSAL_ROUTER,
             quoter: Some(*UNIV4_QUOTER),
             token_in: *WETH_BASE,
@@ -154,6 +160,7 @@ pub fn default_quote_steps(token: Address, pool_key: Option<PoolKey>) -> Vec<Rou
         steps.push(RouteStep {
             venue: VenueKind::UniswapV4,
             name: "Clanker Dynamic".to_string(),
+            capabilities: default_capabilities_for_venue(VenueKind::UniswapV4),
             router: *UNIVERSAL_ROUTER,
             quoter: Some(*UNIV4_QUOTER),
             token_in: *WETH_BASE,

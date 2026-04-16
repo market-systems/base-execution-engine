@@ -1,4 +1,4 @@
-use ethers::types::{Address, Bytes, H256, U256};
+use ethers::types::{Address, Bytes, H256, I256, U256};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,10 +97,42 @@ pub struct ContractCall {
     pub value: U256,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VenueCapabilities {
+    pub discoverable: bool,
+    pub plannable: bool,
+    pub simulatable: bool,
+    pub executable: bool,
+}
+
+impl VenueCapabilities {
+    pub const fn new(
+        discoverable: bool,
+        plannable: bool,
+        simulatable: bool,
+        executable: bool,
+    ) -> Self {
+        Self {
+            discoverable,
+            plannable,
+            simulatable,
+            executable,
+        }
+    }
+}
+
+impl Default for VenueCapabilities {
+    fn default() -> Self {
+        Self::new(true, true, true, false)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolEdge {
     pub name: String,
     pub venue: VenueKind,
+    #[serde(default)]
+    pub capabilities: VenueCapabilities,
     pub router: Address,
     pub quoter: Option<Address>,
     pub token_in: Address,
@@ -117,6 +149,8 @@ pub struct PoolEdge {
 pub struct RouteStep {
     pub venue: VenueKind,
     pub name: String,
+    #[serde(default)]
+    pub capabilities: VenueCapabilities,
     pub router: Address,
     pub quoter: Option<Address>,
     pub token_in: Address,
@@ -151,6 +185,10 @@ pub struct SimulationResult {
     pub status: SimulationStatus,
     pub expected_amount_out: U256,
     pub gas_used: u64,
+    pub estimated_gas_cost: U256,
+    pub gross_surplus: I256,
+    pub net_surplus: I256,
+    pub post_trigger_checked: bool,
     pub reason: String,
     pub confidence_bps: u16,
 }
@@ -172,6 +210,180 @@ pub struct ExecutionDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionRequest {
+    pub observed_tx_hash: H256,
+    pub route_plan: RoutePlan,
+    pub simulation: SimulationResult,
+    pub router: Address,
+    pub plan: RouterExecutionPlan,
+    pub calls: Vec<ContractCall>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionVenueKind {
+    Unsupported,
+    UniswapV3Single,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPlanStep {
+    pub venue_kind: ExecutionVenueKind,
+    pub target: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub fee_bps: u32,
+    pub extra_data: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterExecutionPlan {
+    pub settlement_token: Address,
+    pub funding_amount: U256,
+    pub min_repay_amount: U256,
+    pub min_surplus: U256,
+    pub steps: Vec<ExecutionPlanStep>,
+    pub risk_hash: H256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchStatus {
+    Suppressed,
+    Submitted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchResult {
+    pub status: DispatchStatus,
+    pub tx_hash: Option<H256>,
+    pub submitted_from: Option<Address>,
+    pub submitted_nonce: Option<u64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationStatus {
+    Approved,
+    Rejected,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationRejectionReason {
+    UnsupportedAction,
+    MissingTokenIn,
+    MissingTokenOut,
+    MissingAmountIn,
+    NoCandidateRoutes,
+    SimulationFailed,
+    PolicyDenied,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PipelineTimings {
+    pub planning_micros: u64,
+    pub simulation_micros: u64,
+    pub policy_micros: u64,
+    pub total_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpportunityCandidate {
+    pub intent: ObservedIntent,
+    pub settlement_token: Address,
+    pub target_token: Address,
+    pub amount_in: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedOpportunity {
+    pub candidate: OpportunityCandidate,
+    pub routes: Vec<RoutePlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionEvaluation {
+    pub tx_hash: H256,
+    pub candidate: Option<OpportunityCandidate>,
+    pub routes_considered: usize,
+    pub decision: ExecutionDecision,
+    pub status: EvaluationStatus,
+    pub rejection_reason: Option<EvaluationRejectionReason>,
+    pub timings: PipelineTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentStatus {
+    Qualified,
+    Rejected,
+    FilteredOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStatus {
+    PolicyChecked,
+    ReadyToSubmit,
+    BroadcastSuppressed,
+    BroadcastSubmitted,
+    BroadcastFailed,
+    Included,
+    OnchainReverted,
+    Replaced,
+    Dropped,
+    TimedOut,
+    Rejected,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionIntent {
+    pub id: String,
+    pub observed_tx_hash: H256,
+    pub actor: Option<Address>,
+    pub source: Option<EventSource>,
+    pub trigger: Option<ObservedIntent>,
+    pub status: IntentStatus,
+    pub created_at_micros: u64,
+    pub updated_at_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionAttempt {
+    pub id: String,
+    pub intent_id: String,
+    pub routes_considered: usize,
+    pub candidate: Option<OpportunityCandidate>,
+    pub decision: ExecutionDecision,
+    pub request: Option<ExecutionRequest>,
+    pub dispatch: Option<DispatchResult>,
+    #[serde(alias = "shadow_status")]
+    pub evaluation_status: EvaluationStatus,
+    pub rejection_reason: Option<EvaluationRejectionReason>,
+    pub timings: PipelineTimings,
+    pub status: AttemptStatus,
+    pub fail_reason: Option<String>,
+    pub receipt_block_number: Option<u64>,
+    pub receipt_gas_used: Option<u64>,
+    pub created_at_micros: u64,
+    pub updated_at_micros: u64,
+    pub version: u64,
+}
+
+impl ExecutionAttempt {
+    pub fn bump_version(mut self) -> Self {
+        self.version = self.version.saturating_add(1);
+        self.updated_at_micros = self.updated_at_micros.saturating_add(1);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawTransactionEnvelope {
     pub source: EventSource,
     pub tx_hash: H256,
@@ -188,12 +400,15 @@ pub struct ObservedIntent {
     pub source: EventSource,
     pub tx_hash: H256,
     pub actor: Address,
+    pub router: Address,
     pub venue: VenueKind,
     pub action: ActionKind,
     pub token_in: Option<Address>,
     pub token_out: Option<Address>,
     pub amount_in: Option<U256>,
     pub pool_key: Option<PoolKey>,
+    pub input: Bytes,
+    pub value: U256,
     pub raw_selector: Option<String>,
     pub metadata: Value,
 }
@@ -220,6 +435,23 @@ impl RoutePlan {
         }
         path
     }
+
+    pub fn is_simulatable(&self) -> bool {
+        self.steps.iter().all(|step| step.capabilities.simulatable)
+    }
+
+    pub fn is_executable(&self) -> bool {
+        self.steps.iter().all(|step| step.capabilities.executable)
+    }
+
+    pub fn is_cycle(&self) -> bool {
+        self.source_token == self.target_token
+            && self
+                .steps
+                .last()
+                .map(|step| step.token_out == self.source_token)
+                .unwrap_or(false)
+    }
 }
 
 impl From<&PoolEdge> for RouteStep {
@@ -227,6 +459,7 @@ impl From<&PoolEdge> for RouteStep {
         Self {
             venue: edge.venue,
             name: edge.name.clone(),
+            capabilities: edge.capabilities,
             router: edge.router,
             quoter: edge.quoter,
             token_in: edge.token_in,
@@ -237,6 +470,17 @@ impl From<&PoolEdge> for RouteStep {
             pool_key: edge.pool_key.clone(),
             estimated_gas: edge.estimated_gas,
         }
+    }
+}
+
+pub fn default_capabilities_for_venue(venue: VenueKind) -> VenueCapabilities {
+    match venue {
+        VenueKind::UniswapV3 => VenueCapabilities::new(true, true, true, true),
+        VenueKind::UniswapV2 => VenueCapabilities::new(true, true, true, false),
+        VenueKind::AerodromeV2 => VenueCapabilities::new(true, true, true, false),
+        VenueKind::UniswapV4 => VenueCapabilities::new(true, true, true, false),
+        VenueKind::Virtuals => VenueCapabilities::new(true, true, false, false),
+        VenueKind::Unknown => VenueCapabilities::new(false, false, false, false),
     }
 }
 

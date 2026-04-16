@@ -4,9 +4,14 @@ members = [
     "crates/common",
     "crates/config",
     "crates/decode",
+    "crates/execution",
     "crates/graph",
     "crates/ingress",
+    "crates/orchestrator",
+    "crates/policy",
+    "crates/reconcile",
     "crates/simulation",
+    "crates/state",
     "crates/strategy",
 ]
 default-members = ["crates/app"]
