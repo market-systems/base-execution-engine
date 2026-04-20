@@ -1,14 +1,11 @@
 [package]
-name = "app"
+name = "executor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 config = { path = "../config" }
-core = { path = "../core" }
-executor = { path = "../executor" }
-ingest = { path = "../ingest" }
 types = { path = "../types" }
 anyhow.workspace = true
 tokio.workspace = true

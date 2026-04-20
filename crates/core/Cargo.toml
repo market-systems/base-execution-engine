@@ -1,11 +1,12 @@
 [package]
-name = "orchestrator"
+name = "core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+config = { path = "../config" }
+types = { path = "../types" }
 anyhow.workspace = true
-common = { path = "../common" }
-ethers.workspace = true
-state = { path = "../state" }
+tokio.workspace = true
+tracing.workspace = true
