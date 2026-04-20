@@ -9,6 +9,7 @@ config = { path = "../config" }
 decision = { path = "../decision" }
 execution = { path = "../execution" }
 ingest = { path = "../ingest" }
+serde_json.workspace = true
 types = { path = "../types" }
 anyhow.workspace = true
 tokio.workspace = true

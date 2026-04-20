@@ -25,6 +25,7 @@ impl AppConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestConfig {
+    pub chain_id: u64,
     pub channel: Channel,
     pub ipc_file_path: Option<String>,
     pub ws_url: Option<String>,
@@ -35,12 +36,15 @@ pub struct IngestConfig {
     pub reconnect_max_ms: u64,
     pub heartbeat_timeout_secs: u64,
     pub dedup_cache_size: usize,
+    pub event_channel_capacity: usize,
+    pub runtime_channel_capacity: usize,
 }
 
 impl IngestConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let channel = parse_channel(required_var("INGEST_CHANNEL")?)?;
         let config = Self {
+            chain_id: u64_var("INGEST_CHAIN_ID", 8_453)?,
             channel,
             ipc_file_path: optional_non_empty("INGEST_IPC_FILE_PATH"),
             ws_url: optional_non_empty("INGEST_WS_URL"),
@@ -51,6 +55,8 @@ impl IngestConfig {
             reconnect_max_ms: u64_var("INGEST_RECONNECT_MAX_MS", 10_000)?,
             heartbeat_timeout_secs: u64_var("INGEST_HEARTBEAT_TIMEOUT_SECS", 15)?,
             dedup_cache_size: usize_var("INGEST_DEDUP_CACHE_SIZE", 50_000)?,
+            event_channel_capacity: usize_var("INGEST_EVENT_CHANNEL_CAPACITY", 4_096)?,
+            runtime_channel_capacity: usize_var("INGEST_RUNTIME_CHANNEL_CAPACITY", 512)?,
         };
 
         config.validate()?;
@@ -58,6 +64,12 @@ impl IngestConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.chain_id == 0 {
+            return Err(ConfigError::Validation(
+                "INGEST_CHAIN_ID must be greater than zero",
+            ));
+        }
+
         match self.channel {
             Channel::Ipc => {
                 if self.ipc_file_path.is_none() {
@@ -104,6 +116,18 @@ impl IngestConfig {
         if self.dedup_cache_size == 0 {
             return Err(ConfigError::Validation(
                 "INGEST_DEDUP_CACHE_SIZE must be greater than zero",
+            ));
+        }
+
+        if self.event_channel_capacity == 0 {
+            return Err(ConfigError::Validation(
+                "INGEST_EVENT_CHANNEL_CAPACITY must be greater than zero",
+            ));
+        }
+
+        if self.runtime_channel_capacity == 0 {
+            return Err(ConfigError::Validation(
+                "INGEST_RUNTIME_CHANNEL_CAPACITY must be greater than zero",
             ));
         }
 
@@ -206,6 +230,7 @@ mod tests {
     #[test]
     fn validates_ipc_channel_requirements() {
         let config = IngestConfig {
+            chain_id: 8_453,
             channel: Channel::Ipc,
             ipc_file_path: None,
             ws_url: Some("ws://127.0.0.1:8546".to_string()),
@@ -216,17 +241,23 @@ mod tests {
             reconnect_max_ms: 10_000,
             heartbeat_timeout_secs: 15,
             dedup_cache_size: 50_000,
+            event_channel_capacity: 4_096,
+            runtime_channel_capacity: 512,
         };
 
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::MissingRequired { key: "INGEST_IPC_FILE_PATH", .. })
+            Err(ConfigError::MissingRequired {
+                key: "INGEST_IPC_FILE_PATH",
+                ..
+            })
         ));
     }
 
     #[test]
     fn validates_ws_channel_requirements() {
         let config = IngestConfig {
+            chain_id: 8_453,
             channel: Channel::Ws,
             ipc_file_path: Some("/tmp/reth.ipc".to_string()),
             ws_url: None,
@@ -237,17 +268,23 @@ mod tests {
             reconnect_max_ms: 10_000,
             heartbeat_timeout_secs: 15,
             dedup_cache_size: 50_000,
+            event_channel_capacity: 4_096,
+            runtime_channel_capacity: 512,
         };
 
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::MissingRequired { key: "INGEST_WS_URL", .. })
+            Err(ConfigError::MissingRequired {
+                key: "INGEST_WS_URL",
+                ..
+            })
         ));
     }
 
     #[test]
     fn rejects_disabled_subscriptions() {
         let config = IngestConfig {
+            chain_id: 8_453,
             channel: Channel::Ipc,
             ipc_file_path: Some("/tmp/reth.ipc".to_string()),
             ws_url: None,
@@ -258,11 +295,10 @@ mod tests {
             reconnect_max_ms: 10_000,
             heartbeat_timeout_secs: 15,
             dedup_cache_size: 50_000,
+            event_channel_capacity: 4_096,
+            runtime_channel_capacity: 512,
         };
 
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::Validation(_))
-        ));
+        assert!(matches!(config.validate(), Err(ConfigError::Validation(_))));
     }
 }

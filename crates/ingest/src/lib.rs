@@ -13,11 +13,11 @@ pub mod stream;
 
 pub use channel::{IngestEndpoint, IpcChannel, WsChannel};
 pub use error::IngestError;
-pub use pipeline::IngestPipeline;
+pub use pipeline::{IngestPipeline, IngestRuntime};
 pub use raw::{
     DecodedLogFields, RawBlockMessage, RawLogMessage, RawTransactionMessage, TransactionDecode,
 };
 pub use stream::{
-    BlockStream, BoxedIngestStream, EventSender, IngestStream, IngestStreamContext,
-    LogStream, StreamSubscription, TransactionStream,
+    BlockStream, BoxedIngestStream, EventSender, IngestStream, IngestStreamContext, LogStream,
+    RuntimeEventSender, StreamSubscription, TransactionStream,
 };

@@ -1,9 +1,15 @@
 use crate::error::IngestError;
+use crate::raw::RawLogMessage;
+use crate::stream::rpc::JsonRpcSession;
 use crate::stream::{
-    EventSender, IngestStream, IngestStreamContext, StreamRuntime, StreamSubscription,
+    current_time_ms, decode_status, emit_heartbeat, payload_size_bytes, raw_summary, send_event,
+    EventSender, IngestStream, IngestStreamContext, RuntimeEventSender, StreamRuntime,
+    StreamSubscription,
 };
 use async_trait::async_trait;
-use types::ingest::{Channel, StreamStatus};
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
+use types::ingest::{Channel, Event, Metadata, RawMessageType, StreamStatus};
 use types::ChainId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,17 +21,107 @@ pub struct LogStream {
 impl LogStream {
     pub fn new(context: IngestStreamContext) -> Self {
         Self {
-            runtime: StreamRuntime::new(
-                "log_stream",
-                context.channel,
-                StreamSubscription::Logs,
-            ),
+            runtime: StreamRuntime::new("log_stream", StreamSubscription::Logs),
             context,
         }
     }
 
     pub fn chain_id(&self) -> ChainId {
         self.context.chain_id
+    }
+
+    async fn run_once(
+        &mut self,
+        sender: &EventSender,
+        runtime_sender: &RuntimeEventSender,
+    ) -> Result<(), IngestError> {
+        let mut session = JsonRpcSession::connect(self.context.endpoint(), self.name()).await?;
+
+        self.runtime
+            .transition(
+                &self.context,
+                runtime_sender,
+                StreamStatus::Subscribing,
+                None,
+            )
+            .await?;
+
+        let subscription_id = session.subscribe(self.subscription()).await?;
+
+        self.runtime
+            .transition(
+                &self.context,
+                runtime_sender,
+                StreamStatus::Running,
+                Some(format!("subscription={subscription_id}")),
+            )
+            .await?;
+
+        let timeout_window = Duration::from_secs(self.context.heartbeat_timeout_secs);
+        let mut idle_intervals = 0_usize;
+
+        loop {
+            let payload = match timeout(
+                timeout_window,
+                session.next_subscription_payload(&subscription_id),
+            )
+            .await
+            {
+                Ok(result) => {
+                    idle_intervals = 0;
+                    result?
+                }
+                Err(_) => {
+                    idle_intervals += 1;
+                    emit_heartbeat(
+                        runtime_sender,
+                        &self.context,
+                        Some(format!(
+                            "{} idle for {}s",
+                            self.name(),
+                            self.context.heartbeat_timeout_secs
+                        )),
+                    )
+                    .await?;
+
+                    if idle_intervals >= 2 {
+                        return Err(IngestError::StreamFailure {
+                            stream_name: self.name(),
+                            message: "log subscription heartbeat timeout".to_string(),
+                        });
+                    }
+
+                    continue;
+                }
+            };
+
+            let raw =
+                RawLogMessage::from_value(&payload).ok_or_else(|| IngestError::InvalidPayload {
+                    stream_name: self.name(),
+                    message: "log payload was not an object".to_string(),
+                })?;
+            let decoded = raw.decode();
+            let metadata = Metadata {
+                block_context: raw.block_context(),
+                channel: self.channel(),
+                observed_at_ms: current_time_ms(),
+                chain_id: self.chain_id(),
+                tx_hash: raw.tx_hash.clone(),
+                decode_status: decode_status(
+                    decoded.protocol,
+                    decoded.exchange,
+                    decoded.event_signature.is_some() || raw.address.is_some(),
+                ),
+                raw: raw_summary(
+                    RawMessageType::Log,
+                    payload_size_bytes(&payload)?,
+                    raw.tx_hash.clone().or(decoded.event_signature.clone()),
+                    self.subscription(),
+                ),
+            };
+
+            send_event(sender, Event::Log(raw.to_log(metadata))).await?;
+        }
     }
 }
 
@@ -36,7 +132,7 @@ impl IngestStream for LogStream {
     }
 
     fn channel(&self) -> Channel {
-        self.runtime.channel
+        self.context.channel()
     }
 
     fn status(&self) -> StreamStatus {
@@ -47,11 +143,60 @@ impl IngestStream for LogStream {
         self.runtime.subscription
     }
 
-    async fn run(&mut self, _sender: EventSender) -> Result<(), IngestError> {
+    async fn run(
+        &mut self,
+        sender: EventSender,
+        runtime_sender: RuntimeEventSender,
+    ) -> Result<(), IngestError> {
         self.runtime.ensure_not_stopped()?;
-        self.runtime.set_status(StreamStatus::Connecting);
-        self.runtime.set_status(StreamStatus::Subscribing);
-        self.runtime.set_status(StreamStatus::Running);
-        Ok(())
+        let mut backoff_ms = self.context.reconnect_initial_ms;
+
+        loop {
+            self.runtime
+                .transition(
+                    &self.context,
+                    &runtime_sender,
+                    StreamStatus::Connecting,
+                    None,
+                )
+                .await?;
+
+            match self.run_once(&sender, &runtime_sender).await {
+                Ok(()) => {
+                    self.runtime
+                        .transition(
+                            &self.context,
+                            &runtime_sender,
+                            StreamStatus::Stopped,
+                            Some("log stream completed".to_string()),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.runtime
+                        .transition(
+                            &self.context,
+                            &runtime_sender,
+                            StreamStatus::Backoff,
+                            Some(reason.clone()),
+                        )
+                        .await?;
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                    self.runtime
+                        .transition(
+                            &self.context,
+                            &runtime_sender,
+                            StreamStatus::Reconnecting,
+                            Some(reason),
+                        )
+                        .await?;
+                    backoff_ms = backoff_ms
+                        .saturating_mul(2)
+                        .min(self.context.reconnect_max_ms);
+                }
+            }
+        }
     }
 }

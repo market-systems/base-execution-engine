@@ -7,9 +7,13 @@ license.workspace = true
 [dependencies]
 async-trait = "0.1"
 config = { path = "../config" }
+futures-util.workspace = true
 registry = { path = "../registry" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 types = { path = "../types" }
 anyhow.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true
