@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 config = { path = "../config" }
-core = { path = "../core" }
-executor = { path = "../executor" }
+decision = { path = "../decision" }
+execution = { path = "../execution" }
 ingest = { path = "../ingest" }
 types = { path = "../types" }
 anyhow.workspace = true

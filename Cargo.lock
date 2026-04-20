@@ -14,8 +14,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "config",
- "core",
- "executor",
+ "decision",
+ "execution",
  "ingest",
  "tokio",
  "tracing",
@@ -49,7 +49,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "core"
+name = "decision"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -70,7 +70,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "executor"
+name = "execution"
 version = "0.1.0"
 dependencies = [
  "anyhow",

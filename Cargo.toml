@@ -4,8 +4,8 @@ members = [
     "crates/config",
     "crates/types",
     "crates/ingest",
-    "crates/core",
-    "crates/executor",
+    "crates/decision",
+    "crates/execution",
 ]
 default-members = ["crates/app"]
 resolver = "2"

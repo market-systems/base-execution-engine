@@ -34,8 +34,8 @@ flowchart LR
 
     subgraph RUNTIME["Runtime"]
         D["ingest\nconnect + decode + normalize"]
-        E["core\nmarkets + opportunities + planning + simulation + risk + build"]
-        F["executor\nbalances + submit + reconcile"]
+        E["decision\nmarkets + opportunities + planning + simulation + risk + build"]
+        F["execution\nbalances + submit + reconcile"]
     end
 
     subgraph SHARED["Shared"]
@@ -103,8 +103,8 @@ crates/
   config/     typed configuration and validation
   types/      shared domain types and errors
   ingest/     connectors, decoding, normalization, protocol metadata
-  core/       markets, opportunities, planner, simulator, risk, builder
-  executor/   balances, nonce handling, submission, reconciliation
+  decision/   markets, opportunities, planner, simulator, risk, builder
+  execution/  balances, nonce handling, submission, reconciliation, outcomes
 contracts/
   BaseExecutionRouter.sol
 ```
@@ -140,7 +140,7 @@ contracts/
 - event normalization
 - protocol and venue metadata needed during ingest
 
-### `core`
+### `decision`
 
 - market, account, and execution state needed for decision-making
 - opportunity detection
@@ -149,7 +149,7 @@ contracts/
 - risk checks
 - execution request building
 
-### `executor`
+### `execution`
 
 - balances and allowances
 - nonce handling
