@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 config = { path = "../config" }
+thiserror.workspace = true
 types = { path = "../types" }
 anyhow.workspace = true
 tokio.workspace = true

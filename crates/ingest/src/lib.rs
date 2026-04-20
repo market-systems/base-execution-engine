@@ -2,10 +2,20 @@
 
 //! Input boundary for the system.
 //!
-//! This crate will own everything related to getting data into the engine:
-//!
-//! - Flashblocks connectivity
-//! - Base RPC and chain reads needed during ingest
-//! - protocol decoding
-//! - input normalization
-//! - protocol and venue metadata used by ingest
+//! This crate owns the conversion from external chain connectivity into the
+//! normalized event stream consumed by `decision`.
+
+pub mod channel;
+pub mod error;
+pub mod pipeline;
+pub mod raw;
+pub mod stream;
+
+pub use channel::{IngestEndpoint, IpcChannel, WsChannel};
+pub use error::IngestError;
+pub use pipeline::IngestPipeline;
+pub use raw::{DecodedTransactionFields, RawBlockMessage, RawLogMessage, RawTransactionMessage};
+pub use stream::{
+    BlockStream, BoxedIngestStream, EventSender, IngestStream, IngestStreamContext,
+    LogStream, StreamSubscription, TransactionStream,
+};
