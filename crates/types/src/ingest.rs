@@ -1,5 +1,5 @@
 use crate::{
-    Address, BlockHash, BlockNumber, ChainId, Selector, Topic, TxHash, UnixTimestampMillis,
+    Address, Amount, BlockHash, BlockNumber, ChainId, Selector, Topic, TxHash, UnixTimestampMillis,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,58 @@ pub struct Metadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedSwap {
+    pub pool: Option<Address>,
+    pub router: Option<Address>,
+    pub token_in: Option<Address>,
+    pub token_out: Option<Address>,
+    pub amount_in: Option<Amount>,
+    pub amount_out: Option<Amount>,
+    pub amount_in_maximum: Option<Amount>,
+    pub amount_out_minimum: Option<Amount>,
+    pub exact_input: Option<bool>,
+    pub recipient: Option<Address>,
+    pub protocol: Option<Protocol>,
+    pub exchange: Option<Exchange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecodedLogKind {
+    V2Swap,
+    V2Sync,
+    V2Mint,
+    V2Burn,
+    V3Swap,
+    V3Mint,
+    V3Burn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedLogEvent {
+    pub kind: DecodedLogKind,
+    pub pool: Option<Address>,
+    pub sender: Option<Address>,
+    pub recipient: Option<Address>,
+    pub owner: Option<Address>,
+    pub reserve0: Option<Amount>,
+    pub reserve1: Option<Amount>,
+    pub amount0_in: Option<Amount>,
+    pub amount1_in: Option<Amount>,
+    pub amount0_out: Option<Amount>,
+    pub amount1_out: Option<Amount>,
+    pub amount0: Option<String>,
+    pub amount1: Option<String>,
+    pub liquidity: Option<Amount>,
+    pub sqrt_price_x96: Option<String>,
+    pub tick: Option<i32>,
+    pub tick_lower: Option<i32>,
+    pub tick_upper: Option<i32>,
+    pub protocol: Option<Protocol>,
+    pub exchange: Option<Exchange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub metadata: Metadata,
     pub from: Option<Address>,
@@ -103,6 +155,7 @@ pub struct Transaction {
     pub value: Option<String>,
     pub input: Option<String>,
     pub selector: Option<Selector>,
+    pub decoded_swap: Option<DecodedSwap>,
     pub protocol: Option<Protocol>,
     pub exchange: Option<Exchange>,
 }
@@ -114,6 +167,7 @@ pub struct Log {
     pub topics: Vec<Topic>,
     pub data: Option<String>,
     pub event_signature: Option<String>,
+    pub decoded_event: Option<DecodedLogEvent>,
     pub protocol: Option<Protocol>,
     pub exchange: Option<Exchange>,
     pub log_index: Option<u64>,

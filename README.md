@@ -6,6 +6,16 @@ signals, build a runtime view of pools, opportunities, balances, and pending
 executions, simulate and risk-check candidate routes, submit transactions, and
 reconcile realized outcomes.
 
+Repository planning docs:
+
+- [Production roadmap](docs/PROD_READY_BASE_ARBITRAGE_ROADMAP.md)
+- [Implementation checklist](docs/IMPLEMENTATION_CHECKLIST.md)
+
+Useful config examples:
+
+- [Base liquidity seeds](config/base-liquidity-seeds.example.json)
+- [V2 bootstrap pools](config/v2-pool-bootstrap.example.json)
+
 ## Scope
 
 The system is built for execution workloads that depend on both
@@ -102,6 +112,10 @@ crates/
   app/        runtime entrypoint and wiring
   config/     typed configuration and validation
   types/      shared domain types and errors
+  observability/ tracing, metrics, and health checks
+  storage/    postgres connectivity and persistence
+  rpc/        rpc topology and provider wiring
+  markets/    pool state and deterministic quote math
   ingest/     connectors, decoding, normalization, protocol metadata
   decision/   markets, opportunities, planner, simulator, risk, builder
   execution/  balances, nonce handling, submission, reconciliation, outcomes

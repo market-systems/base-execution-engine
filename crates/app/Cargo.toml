@@ -5,12 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 config = { path = "../config" }
 decision = { path = "../decision" }
 execution = { path = "../execution" }
 ingest = { path = "../ingest" }
+markets = { path = "../markets" }
+observability = { path = "../observability" }
+rpc = { path = "../rpc" }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+storage = { path = "../storage" }
 types = { path = "../types" }
-anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

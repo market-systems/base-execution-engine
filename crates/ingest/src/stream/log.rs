@@ -110,7 +110,9 @@ impl LogStream {
                 decode_status: decode_status(
                     decoded.protocol,
                     decoded.exchange,
-                    decoded.event_signature.is_some() || raw.address.is_some(),
+                    decoded.decoded_event.is_some()
+                        || decoded.event_signature.is_some()
+                        || raw.address.is_some(),
                 ),
                 raw: raw_summary(
                     RawMessageType::Log,

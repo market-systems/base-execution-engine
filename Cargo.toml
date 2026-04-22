@@ -7,6 +7,10 @@ members = [
     "crates/ingest",
     "crates/decision",
     "crates/execution",
+    "crates/observability",
+    "crates/rpc",
+    "crates/storage",
+    "crates/markets",
 ]
 default-members = ["crates/app"]
 resolver = "2"
@@ -18,10 +22,18 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+alloy-primitives = "0.8"
+alloy-sol-types = "0.8"
