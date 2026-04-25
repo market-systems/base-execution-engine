@@ -7,12 +7,14 @@
 
 pub mod channel;
 pub mod error;
+pub mod flashblocks;
 pub mod pipeline;
 pub mod raw;
 pub mod stream;
 
 pub use channel::{IngestEndpoint, IpcChannel, WsChannel};
 pub use error::IngestError;
+pub use flashblocks::FlashblocksStream;
 pub use pipeline::{IngestPipeline, IngestRuntime};
 pub use raw::{
     DecodedLogFields, RawBlockMessage, RawLogMessage, RawTransactionMessage, TransactionDecode,

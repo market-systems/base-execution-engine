@@ -1,7 +1,7 @@
+use alloy_transport::TransportError;
 use serde_json::Error as SerdeJsonError;
 use std::io;
 use thiserror::Error;
-use tokio_tungstenite::tungstenite;
 use types::ingest::Channel;
 
 #[derive(Debug, Error)]
@@ -26,8 +26,11 @@ pub enum IngestError {
     TransportIo(#[from] io::Error),
     #[error("json decode error: {0}")]
     Json(#[from] SerdeJsonError),
-    #[error("websocket error: {0}")]
-    WebSocket(#[from] tungstenite::Error),
+    /// Wraps any alloy transport-level failure (ws/ipc handshake errors,
+    /// pubsub frontend disconnects, request/response decode errors). The
+    /// stream layer treats these as transient and reconnects via backoff.
+    #[error("alloy transport error: {0}")]
+    AlloyTransport(#[from] TransportError),
     #[error("json-rpc error for `{stream_name}`: {message}")]
     JsonRpc {
         stream_name: &'static str,

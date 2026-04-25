@@ -2,9 +2,23 @@
 
 //! Market state and deterministic quote math.
 //!
-//! This crate is the beginning of the runtime state layer used by decision.
-//! The first implemented slice focuses on constant-product pools because they
-//! are small, fast, and easy to test in isolation.
+//! Two pool families are modelled today:
+//!
+//! - **V2 / constant product** — covers UniswapV2, BaseSwap, Aerodrome
+//!   stable+volatile, AlienBase, etc. Quote math is the standard
+//!   `x*y=k` formula with a per-pool `fee_bps`.
+//! - **V3 / concentrated liquidity** — covers UniswapV3 and Aerodrome
+//!   Slipstream. State carries `sqrt_price_x96`, active `liquidity`, and
+//!   `tick`; quote math uses the closed-form single-tick swap step. See
+//!   [`v3`] for scope and limitations (tick crossing is deferred).
+//!
+//! Both families are united behind [`PoolState`], inserted into a
+//! [`PoolBook`], and updated incrementally from `DecodedLogEvent`s the
+//! ingest layer ships through `apply_log`.
+
+pub mod v3;
+
+pub use v3::V3PoolState;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -256,18 +270,35 @@ impl V2PoolState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolState {
     V2(V2PoolState),
+    V3(V3PoolState),
 }
 
 impl PoolState {
     pub fn kind(&self) -> PoolKind {
         match self {
             Self::V2(_) => PoolKind::ConstantProduct,
+            Self::V3(_) => PoolKind::ConcentratedLiquidity,
         }
     }
 
     pub fn address(&self) -> &str {
         match self {
             Self::V2(pool) => &pool.address,
+            Self::V3(pool) => &pool.address,
+        }
+    }
+
+    /// Best-effort unified quote dispatch. The decision layer prefers the
+    /// concrete `quote_exact_in` on each pool kind, but this helper is
+    /// useful for code paths that walk a heterogeneous route.
+    pub fn quote_exact_in(
+        &self,
+        token_in: &str,
+        amount_in: Amount,
+    ) -> Result<PoolQuote, MarketError> {
+        match self {
+            Self::V2(pool) => pool.quote_exact_in(token_in, amount_in),
+            Self::V3(pool) => pool.quote_exact_in(token_in, amount_in),
         }
     }
 }
@@ -282,6 +313,11 @@ impl PoolBook {
             .insert(normalize_address_key(&pool.address), PoolState::V2(pool));
     }
 
+    pub fn insert_v3_pool(&mut self, pool: V3PoolState) {
+        self.pools
+            .insert(normalize_address_key(&pool.address), PoolState::V3(pool));
+    }
+
     pub fn pool(&self, address: &str) -> Option<&PoolState> {
         self.pools.get(&normalize_address_key(address))
     }
@@ -289,13 +325,28 @@ impl PoolBook {
     pub fn v2_pool(&self, address: &str) -> Option<&V2PoolState> {
         match self.pool(address) {
             Some(PoolState::V2(pool)) => Some(pool),
-            None => None,
+            _ => None,
+        }
+    }
+
+    pub fn v3_pool(&self, address: &str) -> Option<&V3PoolState> {
+        match self.pool(address) {
+            Some(PoolState::V3(pool)) => Some(pool),
+            _ => None,
         }
     }
 
     pub fn v2_pools(&self) -> impl Iterator<Item = &V2PoolState> {
         self.pools.values().filter_map(|pool| match pool {
             PoolState::V2(pool) => Some(pool),
+            _ => None,
+        })
+    }
+
+    pub fn v3_pools(&self) -> impl Iterator<Item = &V3PoolState> {
+        self.pools.values().filter_map(|pool| match pool {
+            PoolState::V3(pool) => Some(pool),
+            _ => None,
         })
     }
 
@@ -310,6 +361,7 @@ impl PoolBook {
 
         let outcome = match &mut pool_state {
             PoolState::V2(pool) => self.apply_v2_log(pool, log),
+            PoolState::V3(pool) => pool.apply_log(log),
         }?;
 
         self.pools.insert(key, pool_state);

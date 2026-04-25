@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 config = { path = "../config" }
 decision = { path = "../decision" }
+discovery = { path = "../discovery" }
 execution = { path = "../execution" }
 ingest = { path = "../ingest" }
 markets = { path = "../markets" }

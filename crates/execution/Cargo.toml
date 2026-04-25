@@ -6,10 +6,24 @@ license.workspace = true
 
 [dependencies]
 config = { path = "../config" }
+observability = { path = "../observability" }
 types = { path = "../types" }
+rpc = { path = "../rpc" }
 anyhow.workspace = true
 async-trait.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
+alloy-network.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-provider.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local = { workspace = true, features = ["keystore"] }
+alloy-transport-http.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

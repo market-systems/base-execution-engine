@@ -1,6 +1,6 @@
 use crate::error::IngestError;
 use crate::raw::RawLogMessage;
-use crate::stream::rpc::JsonRpcSession;
+use crate::stream::rpc::AlloyPubsubSession;
 use crate::stream::{
     current_time_ms, decode_status, emit_heartbeat, payload_size_bytes, raw_summary, send_event,
     EventSender, IngestStream, IngestStreamContext, RuntimeEventSender, StreamRuntime,
@@ -35,7 +35,7 @@ impl LogStream {
         sender: &EventSender,
         runtime_sender: &RuntimeEventSender,
     ) -> Result<(), IngestError> {
-        let mut session = JsonRpcSession::connect(self.context.endpoint(), self.name()).await?;
+        let session = AlloyPubsubSession::connect(self.context.endpoint(), self.name()).await?;
 
         self.runtime
             .transition(
@@ -46,7 +46,8 @@ impl LogStream {
             )
             .await?;
 
-        let subscription_id = session.subscribe(self.subscription()).await?;
+        let mut handle = session.subscribe(self.subscription()).await?;
+        let subscription_id = handle.id().to_string();
 
         self.runtime
             .transition(
@@ -61,10 +62,7 @@ impl LogStream {
         let mut idle_intervals = 0_usize;
 
         loop {
-            let payload = match timeout(
-                timeout_window,
-                session.next_subscription_payload(&subscription_id),
-            )
+            let payload = match timeout(timeout_window, handle.next_payload(self.name()))
             .await
             {
                 Ok(result) => {
@@ -122,7 +120,13 @@ impl LogStream {
                 ),
             };
 
-            send_event(sender, Event::Log(raw.to_log(metadata))).await?;
+            let log_event = raw.to_log(metadata);
+            observability::record_ingest_event(
+                self.name(),
+                crate::stream::channel_label(self.channel()),
+                crate::stream::decode_status_label(log_event.metadata.decode_status),
+            );
+            send_event(sender, Event::Log(log_event)).await?;
         }
     }
 }

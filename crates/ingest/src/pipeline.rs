@@ -1,5 +1,6 @@
 use crate::channel::{IngestEndpoint, IpcChannel, WsChannel};
 use crate::error::IngestError;
+use crate::flashblocks::FlashblocksStream;
 use crate::stream::{
     BlockStream, BoxedIngestStream, EventSender, IngestStreamContext, LogStream,
     RuntimeEventSender, TransactionStream,
@@ -84,7 +85,21 @@ impl IngestPipeline {
         }
 
         if config.subscribe_blocks {
-            pipeline.add_stream(Box::new(BlockStream::new(context)));
+            pipeline.add_stream(Box::new(BlockStream::new(context.clone())));
+        }
+
+        if config.subscribe_flashblocks {
+            // `validate()` already guarantees the URL is present; defensively
+            // surface the error here so a hand-built `IngestConfig` can't
+            // silently spawn a stream with an empty endpoint.
+            let url = config.flashblocks_ws_url.clone().ok_or_else(|| {
+                IngestError::StreamFailure {
+                    stream_name: "flashblocks_stream",
+                    message: "subscribe_flashblocks=true but flashblocks_ws_url is unset"
+                        .to_string(),
+                }
+            })?;
+            pipeline.add_stream(Box::new(FlashblocksStream::new(context, url)));
         }
 
         Ok(pipeline)
@@ -132,6 +147,10 @@ impl IngestPipeline {
         match config.channel {
             Channel::Ipc => Ok(IpcChannel::from_config(config)?.endpoint().clone()),
             Channel::Ws => Ok(WsChannel::from_config(config)?.endpoint().clone()),
+            // FlashblocksWs is a synthetic channel that only labels flashblock
+            // events on their way out; it is never selected as the *primary*
+            // ingest transport (ws/ipc to the canonical Base node).
+            Channel::FlashblocksWs => Err(IngestError::MissingChannelConfig(Channel::FlashblocksWs)),
         }
     }
 }
@@ -193,5 +212,26 @@ mod tests {
         let pipeline = IngestPipeline::from_config(&config).unwrap();
 
         assert_eq!(pipeline.stream_count(), 2);
+    }
+
+    #[test]
+    fn includes_flashblocks_stream_when_enabled() {
+        let mut config = sample_ipc_config();
+        config.subscribe_flashblocks = true;
+
+        let pipeline = IngestPipeline::from_config(&config).unwrap();
+
+        assert_eq!(pipeline.stream_count(), 4);
+    }
+
+    #[test]
+    fn flashblocks_requires_url() {
+        let mut config = sample_ipc_config();
+        config.subscribe_flashblocks = true;
+        config.flashblocks_ws_url = None;
+
+        let result = IngestPipeline::from_config(&config);
+
+        assert!(matches!(result, Err(IngestError::StreamFailure { .. })));
     }
 }

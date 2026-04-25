@@ -184,3 +184,22 @@ pub(crate) fn raw_summary(
         subscription: Some(subscription_label(subscription).to_string()),
     }
 }
+
+/// Stable Prometheus label for a `Channel`. Cardinality stays bounded by the
+/// number of variants so this is safe to inject into per-event counters.
+pub(crate) fn channel_label(channel: types::ingest::Channel) -> &'static str {
+    match channel {
+        types::ingest::Channel::Ipc => "ipc",
+        types::ingest::Channel::Ws => "ws",
+        types::ingest::Channel::FlashblocksWs => "flashblocks_ws",
+    }
+}
+
+pub(crate) fn decode_status_label(status: types::ingest::DecodeStatus) -> &'static str {
+    match status {
+        types::ingest::DecodeStatus::Decoded => "decoded",
+        types::ingest::DecodeStatus::Partial => "partial",
+        types::ingest::DecodeStatus::Unsupported => "unsupported",
+        types::ingest::DecodeStatus::Failed => "failed",
+    }
+}

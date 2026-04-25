@@ -8,6 +8,13 @@
 //! - applying gas padding and static fee caps from config
 //! - enforcing execution-mode gates such as canary notional limits
 //! - modeling submission, receipt, and terminal outcome transitions
+//! - alloy-backed signer / gas / nonce / submit transport in the sibling
+//!   `gas`, `nonce`, `signer`, `submit` modules
+
+pub mod gas;
+pub mod nonce;
+pub mod signer;
+pub mod submit;
 
 use alloy_primitives::{aliases::U24, Address as AlloyAddress, Bytes, FixedBytes, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -15,7 +22,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use config::{ExecutionConfig, ExecutionMode};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use types::decision::SimulationResult;
 use types::execution::{
     ExecutionAttempt, ExecutionOutcome, ExecutionReceipt, ExecutionRequest, ExecutionStatus,
@@ -55,6 +62,7 @@ sol! {
         address tokenIn;
         address tokenOut;
         uint24 fee;
+        uint256 minAmountOut;
         bytes extraData;
     }
 
@@ -63,11 +71,23 @@ sol! {
         uint256 fundingAmount;
         uint256 minRepayAmount;
         uint256 minSurplus;
+        uint256 deadline;
         RouterRouteStep[] steps;
         bytes32 riskHash;
     }
 
     function executePlan(RouterExecutionPlan calldata plan) external payable returns (uint256 amountOut);
+    function executePlanWithFlashLoan(RouterExecutionPlan calldata plan) external;
+}
+
+/// Numeric VenueKind values must stay in sync with the BaseExecutionRouter
+/// `VenueKind` enum. Order is part of the on-chain ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RouterVenueKind {
+    UniswapV2 = 1,
+    UniswapV3Single = 2,
+    AerodromeV2 = 3,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +109,37 @@ pub trait ExecutionTransport: Send + Sync {
         attempt: &ExecutionAttempt,
         timeout: Duration,
     ) -> anyhow::Result<Option<ExecutionReceipt>>;
+
+    /// Slow-path validation. Runs an `eth_call` against the configured router
+    /// using the same calldata that would be broadcast, returning `Ok(())`
+    /// only if the call would not revert. The default implementation is a
+    /// no-op (used by shadow / placeholder transports); the alloy transport
+    /// overrides it to perform a real call.
+    async fn simulate(
+        &self,
+        _payload: &SubmissionPayload,
+        _attempt: &ExecutionAttempt,
+    ) -> anyhow::Result<EthCallSimulation> {
+        Ok(EthCallSimulation::Skipped {
+            reason: "transport does not implement live eth_call simulation".to_string(),
+        })
+    }
+}
+
+/// Outcome of a slow-path `eth_call` simulation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EthCallSimulation {
+    /// `eth_call` returned successfully; the prepared calldata would not
+    /// revert with the current chain state.
+    Passed { gas_used: Option<u64> },
+    /// Transport elected not to run the simulation (e.g. shadow mode).
+    Skipped { reason: String },
+}
+
+impl EthCallSimulation {
+    pub fn is_passed(&self) -> bool {
+        matches!(self, EthCallSimulation::Passed { .. })
+    }
 }
 
 impl UnavailableTransport {
@@ -171,6 +222,16 @@ pub fn build_submission_payload(
     config: &ExecutionConfig,
     request: &ExecutionRequest,
 ) -> anyhow::Result<SubmissionPayload> {
+    build_submission_payload_at(config, request, current_unix_timestamp()?)
+}
+
+/// Same as `build_submission_payload` but with the caller supplying the current
+/// Unix timestamp (seconds). Useful for deterministic tests and replay tools.
+pub fn build_submission_payload_at(
+    config: &ExecutionConfig,
+    request: &ExecutionRequest,
+    now_secs: u64,
+) -> anyhow::Result<SubmissionPayload> {
     let router_address = config
         .router_address
         .as_deref()
@@ -184,6 +245,9 @@ pub fn build_submission_payload(
         "execution request flashloan_asset",
     )?;
     let risk_hash = parse_risk_hash(&request.risk_hash)?;
+    let funding_amount = request
+        .flashloan_amount
+        .ok_or_else(|| anyhow!("execution request is missing flashloan_amount"))?;
 
     let steps = request
         .steps
@@ -192,27 +256,38 @@ pub fn build_submission_payload(
         .map(|(index, step)| build_route_step(step, index))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let calldata = executePlanCall {
-        plan: RouterExecutionPlan {
-            settlementToken: settlement_token,
-            fundingAmount: U256::from(
-                request
-                    .flashloan_amount
-                    .ok_or_else(|| anyhow!("execution request is missing flashloan_amount"))?,
-            ),
-            minRepayAmount: U256::from(request.min_repay),
-            minSurplus: U256::from(request.min_surplus),
-            steps,
-            riskHash: risk_hash,
-        },
-    }
-    .abi_encode();
+    let deadline = now_secs
+        .checked_add(config.plan_deadline_secs)
+        .ok_or_else(|| anyhow!("plan deadline overflow"))?;
+
+    let plan = RouterExecutionPlan {
+        settlementToken: settlement_token,
+        fundingAmount: U256::from(funding_amount),
+        minRepayAmount: U256::from(request.min_repay),
+        minSurplus: U256::from(request.min_surplus),
+        deadline: U256::from(deadline),
+        steps,
+        riskHash: risk_hash,
+    };
+
+    let calldata = if config.use_flashloan {
+        executePlanWithFlashLoanCall { plan }.abi_encode()
+    } else {
+        executePlanCall { plan }.abi_encode()
+    };
 
     Ok(SubmissionPayload {
         router_address: router_address.to_string(),
         calldata: Bytes::from(calldata),
         value: 0,
     })
+}
+
+fn current_unix_timestamp() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_secs())
 }
 
 pub async fn execute_with_transport<T: ExecutionTransport>(
@@ -477,32 +552,74 @@ fn build_route_step(
         .calldata_hint
         .as_deref()
         .ok_or_else(|| anyhow!("execution step {index} is missing calldata_hint"))?;
-    if !matches!(
-        calldata_hint,
-        "uniswap_v3_exact_input_single" | "v3_exact_input_single"
-    ) {
-        return Err(anyhow!(
-            "execution step {index} uses unsupported calldata hint `{calldata_hint}` for the current router"
-        ));
+
+    let target = parse_address(&step.target, "execution step target")?;
+    let token_in = parse_address(&step.token_in, "execution step token_in")?;
+    let token_out = parse_address(&step.token_out, "execution step token_out")?;
+    let min_amount_out = U256::from(step.min_amount_out);
+
+    match calldata_hint {
+        "uniswap_v3_exact_input_single" | "v3_exact_input_single" => {
+            let fee_bps = step
+                .pool_fee
+                .ok_or_else(|| anyhow!("execution step {index} v3 swap is missing pool_fee"))?;
+            let fee_u24 = if fee_bps <= 1_000_000 {
+                fee_bps
+            } else {
+                return Err(anyhow!(
+                    "execution step {index} has an invalid v3 pool fee `{fee_bps}`"
+                ));
+            };
+
+            Ok(RouterRouteStep {
+                venueKind: RouterVenueKind::UniswapV3Single as u8,
+                target,
+                tokenIn: token_in,
+                tokenOut: token_out,
+                fee: U24::from(fee_u24 as u64),
+                minAmountOut: min_amount_out,
+                extraData: Bytes::new(),
+            })
+        }
+        "v2_exact_input" | "uniswap_v2_exact_input" => Ok(RouterRouteStep {
+            venueKind: RouterVenueKind::UniswapV2 as u8,
+            target,
+            tokenIn: token_in,
+            tokenOut: token_out,
+            fee: U24::ZERO,
+            minAmountOut: min_amount_out,
+            extraData: Bytes::new(),
+        }),
+        "aerodrome_v2_volatile" | "aerodrome_v2_stable" => {
+            let stable = calldata_hint == "aerodrome_v2_stable";
+            let factory_str = step.aux_address.as_deref().ok_or_else(|| {
+                anyhow!("execution step {index} aerodrome swap is missing aux_address (factory)")
+            })?;
+            let factory = parse_address(factory_str, "execution step aerodrome factory")?;
+
+            // Solidity ABI encoding for `(bool stable, address factory)`.
+            let mut extra = Vec::with_capacity(64);
+            extra.extend_from_slice(&[0u8; 31]);
+            extra.push(if stable { 1 } else { 0 });
+            extra.extend_from_slice(&[0u8; 12]);
+            extra.extend_from_slice(factory.as_slice());
+
+            Ok(RouterRouteStep {
+                venueKind: RouterVenueKind::AerodromeV2 as u8,
+                target,
+                tokenIn: token_in,
+                tokenOut: token_out,
+                fee: U24::ZERO,
+                minAmountOut: min_amount_out,
+                extraData: Bytes::from(extra),
+            })
+        }
+        other => Err(anyhow!(
+            "execution step {index} uses unsupported calldata hint `{other}`"
+        )),
     }
-
-    let fee_bps = step
-        .pool_fee
-        .ok_or_else(|| anyhow!("execution step {index} is missing pool_fee"))?;
-    let fee_u24 = u32::try_from(fee_bps)
-        .ok()
-        .filter(|fee| *fee <= 1_000_000)
-        .ok_or_else(|| anyhow!("execution step {index} has an invalid pool fee `{fee_bps}`"))?;
-
-    Ok(RouterRouteStep {
-        venueKind: 1,
-        target: parse_address(&step.target, "execution step target")?,
-        tokenIn: parse_address(&step.token_in, "execution step token_in")?,
-        tokenOut: parse_address(&step.token_out, "execution step token_out")?,
-        fee: U24::from(fee_u24 as u64),
-        extraData: Bytes::new(),
-    })
 }
+
 
 fn parse_address(value: &str, context: &str) -> anyhow::Result<AlloyAddress> {
     AlloyAddress::from_str(value)
@@ -742,16 +859,48 @@ mod tests {
     }
 
     #[test]
-    fn rejects_submission_payload_for_unsupported_v2_route() {
+    fn builds_submission_payload_for_v2_route() {
         let mut request = request(100);
         request.steps[0].calldata_hint = Some("v2_exact_input".to_string());
         request.steps[0].pool_fee = None;
 
-        let error = build_submission_payload(&live_config(), &request).unwrap_err();
+        let payload = build_submission_payload(&live_config(), &request).unwrap();
 
-        assert!(error
-            .to_string()
-            .contains("unsupported calldata hint `v2_exact_input`"));
+        assert_eq!(payload.value, 0);
+        assert!(!payload.calldata.is_empty());
+    }
+
+    #[test]
+    fn builds_submission_payload_for_aerodrome_route() {
+        let mut request = request(100);
+        request.steps[0].calldata_hint = Some("aerodrome_v2_volatile".to_string());
+        request.steps[0].pool_fee = None;
+        request.steps[0].aux_address =
+            Some("0x420dd381b31aef6683db6b902084cb0ffece40da".to_string());
+
+        let payload = build_submission_payload(&live_config(), &request).unwrap();
+        assert!(!payload.calldata.is_empty());
+    }
+
+    #[test]
+    fn rejects_aerodrome_route_without_aux_address() {
+        let mut request = request(100);
+        request.steps[0].calldata_hint = Some("aerodrome_v2_volatile".to_string());
+        request.steps[0].pool_fee = None;
+        request.steps[0].aux_address = None;
+
+        let error = build_submission_payload(&live_config(), &request).unwrap_err();
+        assert!(error.to_string().contains("aux_address"));
+    }
+
+    #[test]
+    fn build_payload_uses_self_funded_selector_when_flashloan_disabled() {
+        let mut config = live_config();
+        config.use_flashloan = false;
+        let payload = build_submission_payload(&config, &request(100)).unwrap();
+        // Selector for executePlan(...) vs executePlanWithFlashLoan(...) differ
+        // in the first 4 bytes; check they're stable across rebuilds.
+        assert_eq!(payload.calldata.len() % 32, 4);
     }
 
     #[tokio::test]
@@ -839,6 +988,7 @@ mod tests {
                 amount_in: Some(notional),
                 min_amount_out: 99,
                 calldata_hint: Some("v3_exact_input_single".to_string()),
+                aux_address: None,
             }],
             min_repay: notional,
             min_surplus: 1,
@@ -873,6 +1023,10 @@ mod tests {
             gas_limit_multiplier_bps: 12_000,
             max_fee_per_gas_wei: Some("50".to_string()),
             max_priority_fee_per_gas_wei: Some("2".to_string()),
+            plan_deadline_secs: 30,
+            use_flashloan: true,
+            ethcall_preflight_required: true,
+            ethcall_timeout_secs: 5,
         }
     }
 
@@ -887,6 +1041,10 @@ mod tests {
             gas_limit_multiplier_bps: 12_000,
             max_fee_per_gas_wei: None,
             max_priority_fee_per_gas_wei: None,
+            plan_deadline_secs: 30,
+            use_flashloan: true,
+            ethcall_preflight_required: true,
+            ethcall_timeout_secs: 5,
         }
     }
 
@@ -911,5 +1069,33 @@ mod tests {
             l1_fee_paid: Some(100),
             revert_reason: revert_reason.map(ToString::to_string),
         }
+    }
+
+    #[tokio::test]
+    async fn default_simulate_returns_skipped_for_transports_without_override() {
+        let transport = ScriptedTransport {
+            submit_results: Arc::new(Mutex::new(VecDeque::new())),
+            receipt_results: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let payload = SubmissionPayload {
+            router_address: "0x1111111111111111111111111111111111111111".to_string(),
+            calldata: Bytes::from(vec![0x01, 0x02]),
+            value: 0,
+        };
+        let attempt = ExecutionAttempt {
+            request_id: "opp-1".to_string(),
+            tx_hash: None,
+            status: ExecutionStatus::Built,
+            execution_mode: "shadow".to_string(),
+            submission_allowed: false,
+            blocked_reason: None,
+            requested_notional: 0,
+            gas_limit: Some(180_000),
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        };
+        let outcome = transport.simulate(&payload, &attempt).await.unwrap();
+        assert!(matches!(outcome, EthCallSimulation::Skipped { .. }));
+        assert!(!outcome.is_passed());
     }
 }

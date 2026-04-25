@@ -11,8 +11,14 @@ use types::decision::{Opportunity, RiskDecision, SimulationResult};
 use types::execution::{ExecutionAttempt, ExecutionOutcome, ExecutionReceipt, ExecutionRequest};
 use types::ingest::Log as IngestLog;
 
+// Engine-managed schema migration: idempotent CREATE TABLE / INDEX, safe to
+// run on every boot when STORAGE_AUTO_MIGRATE=true.
+//
+// `~privileges.sql` is intentionally NOT embedded here — it provisions the
+// database, roles, and grants which require CREATEDB / CREATEROLE that the
+// runtime role must not hold. A DBA runs that file once per cluster as
+// superuser; see the file header for the psql command.
 const INIT_SCHEMA_SQL: &str = include_str!("../../../migration/00000000-00-init.sql");
-const PRIVILEGES_SQL: &str = include_str!("../../../migration/~privileges.sql");
 
 pub struct Storage {
     pool: Option<PgPool>,
@@ -46,12 +52,8 @@ impl Storage {
             sqlx::raw_sql(INIT_SCHEMA_SQL)
                 .execute(&pool)
                 .await
-                .with_context(|| "failed to apply init schema")?;
-            sqlx::raw_sql(PRIVILEGES_SQL)
-                .execute(&pool)
-                .await
-                .with_context(|| "failed to apply privileges schema")?;
-            tracing::info!("storage migrations applied");
+                .with_context(|| "failed to apply 00000000-00-init.sql")?;
+            tracing::info!("storage schema migration applied (00000000-00-init.sql)");
         }
 
         tracing::info!(

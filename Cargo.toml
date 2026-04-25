@@ -11,6 +11,7 @@ members = [
     "crates/rpc",
     "crates/storage",
     "crates/markets",
+    "crates/discovery",
 ]
 default-members = ["crates/app"]
 resolver = "2"
@@ -37,3 +38,18 @@ metrics-exporter-prometheus = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
 alloy-primitives = "0.8"
 alloy-sol-types = "0.8"
+alloy-consensus = "0.8"
+alloy-network = "0.8"
+alloy-provider = { version = "0.8", default-features = false, features = ["reqwest", "ws", "ipc"] }
+alloy-pubsub = "0.8"
+alloy-rpc-client = "0.8"
+alloy-rpc-types-eth = "0.8"
+alloy-signer = "0.8"
+alloy-signer-local = "0.8"
+alloy-transport = "0.8"
+alloy-transport-http = { version = "0.8", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
+alloy-transport-ws = "0.8"
+alloy-transport-ipc = "0.8"
+alloy-eips = "0.8"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

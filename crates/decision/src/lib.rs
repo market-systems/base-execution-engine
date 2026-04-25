@@ -6,12 +6,15 @@
 //!
 //! - detect two-leg V2 loops from a `PoolBook`
 //! - simulate them with an explicit cost model
-//! - apply a deterministic risk gate
+//! - apply a deterministic risk gate via [`risk::RiskEngine`]
 //! - build an `ExecutionRequest` for downstream execution
+
+pub mod risk;
+
+pub use risk::{RiskEngine, RiskPolicy};
 
 use config::DecisionConfig;
 use markets::{PoolBook, V2PoolState};
-use sha2::{Digest, Sha256};
 use types::decision::{Opportunity, OpportunityKind, RiskDecision, RouteLeg, SimulationResult};
 use types::execution::{ExecutionRequest, ExecutionStep};
 use types::{Address, Amount, BlockContext};
@@ -204,6 +207,12 @@ pub fn simulate_two_leg_opportunity(
     })
 }
 
+/// Stateless legacy entry point retained for backwards compatibility with
+/// scripts and tests that have not yet been migrated to [`RiskEngine`]. It
+/// applies only the absolute profit floor pulled from
+/// `DecisionConfig::min_net_profit_wei`. Production callers MUST use
+/// [`RiskEngine`] for full coverage of notional caps, allowlists, slippage
+/// ceilings, and the kill switch.
 pub fn assess_risk(
     opportunity: &Opportunity,
     simulation: &SimulationResult,
@@ -221,7 +230,7 @@ pub fn assess_risk(
         opportunity_id: opportunity.id.clone(),
         accepted,
         reason,
-        risk_hash: risk_hash(opportunity, simulation, min_surplus),
+        risk_hash: risk::risk_hash(opportunity, simulation, min_surplus),
         min_surplus,
     })
 }
@@ -246,6 +255,7 @@ pub fn build_execution_request(
             amount_in: leg.amount_in,
             min_amount_out: leg.min_amount_out?,
             calldata_hint: Some("v2_exact_input".to_string()),
+            aux_address: None,
         });
     }
 
@@ -260,20 +270,6 @@ pub fn build_execution_request(
     })
 }
 
-fn risk_hash(
-    opportunity: &Opportunity,
-    simulation: &SimulationResult,
-    min_surplus: Amount,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(opportunity.id.as_bytes());
-    hasher.update(opportunity.expected_output_amount.to_le_bytes());
-    hasher.update(simulation.expected_net_profit.to_le_bytes());
-    hasher.update(simulation.gas_cost_wei.to_le_bytes());
-    hasher.update(simulation.l1_data_fee.to_le_bytes());
-    hasher.update(min_surplus.to_le_bytes());
-    format!("{:x}", hasher.finalize())
-}
 
 #[cfg(test)]
 mod tests {

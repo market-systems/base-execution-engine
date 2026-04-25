@@ -18,9 +18,11 @@ pub struct AppConfig {
     pub rpc: RpcConfig,
     pub signer: SignerConfig,
     pub decision: DecisionConfig,
+    pub risk: RiskConfig,
     pub execution: ExecutionConfig,
     pub storage: StorageConfig,
     pub metrics: MetricsConfig,
+    pub discovery: DiscoveryConfig,
 }
 
 impl AppConfig {
@@ -30,9 +32,11 @@ impl AppConfig {
             rpc: RpcConfig::from_env()?,
             signer: SignerConfig::from_env()?,
             decision: DecisionConfig::from_env()?,
+            risk: RiskConfig::from_env()?,
             execution: ExecutionConfig::from_env()?,
             storage: StorageConfig::from_env()?,
             metrics: MetricsConfig::from_env()?,
+            discovery: DiscoveryConfig::from_env()?,
         };
 
         config.validate()?;
@@ -44,9 +48,11 @@ impl AppConfig {
         self.rpc.validate()?;
         self.signer.validate(&self.execution)?;
         self.decision.validate()?;
+        self.risk.validate(&self.execution)?;
         self.execution.validate()?;
         self.storage.validate()?;
         self.metrics.validate()?;
+        self.discovery.validate()?;
         Ok(())
     }
 }
@@ -238,6 +244,7 @@ impl RpcConfig {
 pub struct SignerConfig {
     pub private_key: Option<String>,
     pub keystore_path: Option<String>,
+    pub keystore_password: Option<String>,
     pub aws_kms_key_id: Option<String>,
 }
 
@@ -246,6 +253,7 @@ impl SignerConfig {
         Ok(Self {
             private_key: optional_non_empty_any(&["SIGNER_PRIVATE_KEY", "EXECUTOR_PRIVATE_KEY"]),
             keystore_path: optional_non_empty_any(&["SIGNER_KEYSTORE_PATH"]),
+            keystore_password: optional_non_empty_any(&["SIGNER_KEYSTORE_PASSWORD"]),
             aws_kms_key_id: optional_non_empty_any(&["SIGNER_AWS_KMS_KEY_ID"]),
         })
     }
@@ -352,6 +360,115 @@ impl DecisionConfig {
     }
 }
 
+/// Runtime risk policy applied to every opportunity before it is forwarded to
+/// the execution stage. The fields fall into three buckets:
+///
+/// - **Profit floors** (`min_net_profit_wei`, `min_profit_bps`): a candidate
+///   must clear both an absolute and a relative threshold. The relative one
+///   is critical at high notional sizes where a small absolute number can
+///   still be adverse selection.
+/// - **Notional caps** (`max_trade_notional_wei`, `max_per_block_notional_wei`,
+///   `max_daily_notional_wei`): hard upper bounds on how much capital can be
+///   committed in a single trade, in a single block, and over a 24h rolling
+///   window.
+/// - **Containment** (`token_allowlist`, `token_denylist`,
+///   `max_consecutive_reverts`, `kill_switch_path`): defence-in-depth against
+///   tax/honeypot tokens, broken venues, and ops-triggered emergency stops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskConfig {
+    pub min_net_profit_wei: String,
+    pub min_profit_bps: u32,
+    pub max_trade_notional_wei: Option<String>,
+    pub max_per_block_notional_wei: Option<String>,
+    pub max_daily_notional_wei: Option<String>,
+    pub max_slippage_bps: u32,
+    pub token_allowlist: Vec<String>,
+    pub token_denylist: Vec<String>,
+    pub max_consecutive_reverts: u32,
+    pub kill_switch_path: Option<String>,
+}
+
+impl RiskConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let config = Self {
+            min_net_profit_wei: string_var_any(&["RISK_MIN_NET_PROFIT_WEI"], "0")?,
+            min_profit_bps: u32_var_any(&["RISK_MIN_PROFIT_BPS"], 0)?,
+            max_trade_notional_wei: optional_non_empty_any(&["RISK_MAX_TRADE_NOTIONAL_WEI"]),
+            max_per_block_notional_wei: optional_non_empty_any(
+                &["RISK_MAX_PER_BLOCK_NOTIONAL_WEI"],
+            ),
+            max_daily_notional_wei: optional_non_empty_any(&["RISK_MAX_DAILY_NOTIONAL_WEI"]),
+            max_slippage_bps: u32_var_any(&["RISK_MAX_SLIPPAGE_BPS"], 100)?,
+            token_allowlist: csv_var_any(&["RISK_TOKEN_ALLOWLIST"]),
+            token_denylist: csv_var_any(&["RISK_TOKEN_DENYLIST"]),
+            max_consecutive_reverts: u32_var_any(&["RISK_MAX_CONSECUTIVE_REVERTS"], 3)?,
+            kill_switch_path: optional_non_empty_any(&[
+                "RISK_KILL_SWITCH_PATH",
+                "DECISION_KILL_SWITCH_PATH",
+            ]),
+        };
+        Ok(config)
+    }
+
+    pub fn validate(&self, execution: &ExecutionConfig) -> Result<(), ConfigError> {
+        parse_u128("RISK_MIN_NET_PROFIT_WEI", &self.min_net_profit_wei)?;
+
+        if let Some(raw) = &self.max_trade_notional_wei {
+            parse_u128("RISK_MAX_TRADE_NOTIONAL_WEI", raw)?;
+        }
+        if let Some(raw) = &self.max_per_block_notional_wei {
+            parse_u128("RISK_MAX_PER_BLOCK_NOTIONAL_WEI", raw)?;
+        }
+        if let Some(raw) = &self.max_daily_notional_wei {
+            parse_u128("RISK_MAX_DAILY_NOTIONAL_WEI", raw)?;
+        }
+
+        if self.min_profit_bps > 10_000 {
+            return Err(ConfigError::Validation(
+                "RISK_MIN_PROFIT_BPS must be <= 10000",
+            ));
+        }
+        if self.max_slippage_bps > 10_000 {
+            return Err(ConfigError::Validation(
+                "RISK_MAX_SLIPPAGE_BPS must be <= 10000",
+            ));
+        }
+
+        // Live and canary cannot rely on shadow defaults: every committed
+        // wallet MUST have an explicit per-trade and daily ceiling. Shadow
+        // does not submit so the ceilings are advisory.
+        if execution.mode != ExecutionMode::Shadow {
+            if self.max_trade_notional_wei.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    key: "RISK_MAX_TRADE_NOTIONAL_WEI",
+                    context: "live/canary execution requires a per-trade notional cap",
+                });
+            }
+            if self.max_daily_notional_wei.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    key: "RISK_MAX_DAILY_NOTIONAL_WEI",
+                    context: "live/canary execution requires a daily notional cap",
+                });
+            }
+        }
+
+        for token in self.token_allowlist.iter().chain(self.token_denylist.iter()) {
+            if !is_valid_address(token) {
+                return Err(ConfigError::Validation(
+                    "RISK_TOKEN_ALLOWLIST / RISK_TOKEN_DENYLIST entries must be 0x-prefixed 20-byte addresses",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn is_valid_address(value: &str) -> bool {
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
@@ -371,6 +488,16 @@ pub struct ExecutionConfig {
     pub gas_limit_multiplier_bps: u32,
     pub max_fee_per_gas_wei: Option<String>,
     pub max_priority_fee_per_gas_wei: Option<String>,
+    pub plan_deadline_secs: u64,
+    pub use_flashloan: bool,
+    /// When true, every accepted opportunity must pass an `eth_call`
+    /// simulation against the live router before submission. Defaults to true
+    /// in canary/live and false in shadow.
+    pub ethcall_preflight_required: bool,
+    /// Maximum time a slow-path `eth_call` simulation may take. Anything
+    /// longer than this aborts the opportunity rather than block the
+    /// pipeline.
+    pub ethcall_timeout_secs: u64,
 }
 
 impl ExecutionConfig {
@@ -390,6 +517,13 @@ impl ExecutionConfig {
             max_priority_fee_per_gas_wei: optional_non_empty_any(&[
                 "EXECUTION_MAX_PRIORITY_FEE_PER_GAS_WEI",
             ]),
+            plan_deadline_secs: u64_var_any(&["EXECUTION_PLAN_DEADLINE_SECS"], 30)?,
+            use_flashloan: bool_var_any(&["EXECUTION_USE_FLASHLOAN"], true)?,
+            ethcall_preflight_required: bool_var_any(
+                &["EXECUTION_ETHCALL_PREFLIGHT_REQUIRED"],
+                true,
+            )?,
+            ethcall_timeout_secs: u64_var_any(&["EXECUTION_ETHCALL_TIMEOUT_SECS"], 5)?,
         };
 
         config.validate()?;
@@ -410,6 +544,14 @@ impl ExecutionConfig {
                 "EXECUTION_GAS_LIMIT_MULTIPLIER_BPS must be at least 10000",
             ));
         }
+        validate_positive_u64(
+            self.plan_deadline_secs,
+            "EXECUTION_PLAN_DEADLINE_SECS must be greater than zero",
+        )?;
+        validate_positive_u64(
+            self.ethcall_timeout_secs,
+            "EXECUTION_ETHCALL_TIMEOUT_SECS must be greater than zero",
+        )?;
 
         if self.mode != ExecutionMode::Shadow && self.router_address.is_none() {
             return Err(ConfigError::MissingRequired {
@@ -526,6 +668,67 @@ impl MetricsConfig {
     }
 }
 
+/// One-shot pool discovery bootstrap. The discovery layer reads
+/// `PairCreated`/`PoolCreated` logs from a configured set of factories,
+/// hydrates pool state via multicall3, and primes the in-memory pool book
+/// before the main loop starts. This struct is the operator-facing knob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    /// When false, the engine boots with whatever is supplied via the static
+    /// `v2_bootstrap_path` and skips on-chain discovery entirely. Default
+    /// `false` to keep existing local environments working unchanged.
+    pub enabled: bool,
+    /// Path to a JSON file describing the factories to scan. The file is a
+    /// list of objects matching `discovery::FactoryConfig`. Required when
+    /// `enabled = true`.
+    pub factories_path: Option<String>,
+    /// Multicall3 deployment to use for state hydration. Required when
+    /// `enabled = true`. On Base mainnet this is the canonical
+    /// `0xcA11bde05977b3631167028862bE2a173976CA11`.
+    pub multicall3_address: Option<String>,
+    /// Optional override for the head block scan ceiling. Useful for
+    /// deterministic replays in CI / fork tests; defaults to the live head
+    /// when not set.
+    pub pinned_head_block: Option<u64>,
+}
+
+impl DiscoveryConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let config = Self {
+            enabled: bool_var_any(&["DISCOVERY_ENABLED"], false)?,
+            factories_path: optional_non_empty_any(&["DISCOVERY_FACTORIES_PATH"]),
+            multicall3_address: optional_non_empty_any(&["DISCOVERY_MULTICALL3_ADDRESS"]),
+            pinned_head_block: optional_non_empty_any(&["DISCOVERY_PINNED_HEAD_BLOCK"])
+                .map(|raw| {
+                    raw.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                        key: "DISCOVERY_PINNED_HEAD_BLOCK",
+                        value: raw,
+                        context: "expected an unsigned integer",
+                    })
+                })
+                .transpose()?,
+        };
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.factories_path.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::Validation(
+                "DISCOVERY_FACTORIES_PATH is required when DISCOVERY_ENABLED=true",
+            ));
+        }
+        if self.multicall3_address.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::Validation(
+                "DISCOVERY_MULTICALL3_ADDRESS is required when DISCOVERY_ENABLED=true",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("missing required configuration `{key}`: {context}")]
@@ -579,6 +782,20 @@ fn bool_var_any(keys: &[&'static str], default: bool) -> Result<bool, ConfigErro
             context: "expected a boolean value",
         }),
     }
+}
+
+/// Comma- or whitespace-separated values; empty entries are dropped, results
+/// are lower-cased so look-ups against on-chain addresses are stable.
+fn csv_var_any(keys: &[&'static str]) -> Vec<String> {
+    let Some(raw) = optional_non_empty_any(keys) else {
+        return Vec::new();
+    };
+
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 fn u64_var_any(keys: &[&'static str], default: u64) -> Result<u64, ConfigError> {
@@ -760,6 +977,10 @@ mod tests {
             gas_limit_multiplier_bps: 12_000,
             max_fee_per_gas_wei: None,
             max_priority_fee_per_gas_wei: None,
+            plan_deadline_secs: 30,
+            use_flashloan: true,
+            ethcall_preflight_required: true,
+            ethcall_timeout_secs: 5,
         }
         .validate()
         .unwrap_err();
@@ -785,6 +1006,10 @@ mod tests {
             gas_limit_multiplier_bps: 9_999,
             max_fee_per_gas_wei: None,
             max_priority_fee_per_gas_wei: None,
+            plan_deadline_secs: 30,
+            use_flashloan: true,
+            ethcall_preflight_required: true,
+            ethcall_timeout_secs: 5,
         }
         .validate()
         .unwrap_err();

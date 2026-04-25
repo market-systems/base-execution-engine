@@ -1,6 +1,6 @@
 use crate::error::IngestError;
 use crate::raw::RawBlockMessage;
-use crate::stream::rpc::JsonRpcSession;
+use crate::stream::rpc::AlloyPubsubSession;
 use crate::stream::{
     current_time_ms, emit_heartbeat, payload_size_bytes, raw_summary, send_event, EventSender,
     IngestStream, IngestStreamContext, RuntimeEventSender, StreamRuntime, StreamSubscription,
@@ -34,7 +34,7 @@ impl BlockStream {
         sender: &EventSender,
         runtime_sender: &RuntimeEventSender,
     ) -> Result<(), IngestError> {
-        let mut session = JsonRpcSession::connect(self.context.endpoint(), self.name()).await?;
+        let session = AlloyPubsubSession::connect(self.context.endpoint(), self.name()).await?;
 
         self.runtime
             .transition(
@@ -45,7 +45,8 @@ impl BlockStream {
             )
             .await?;
 
-        let subscription_id = session.subscribe(self.subscription()).await?;
+        let mut handle = session.subscribe(self.subscription()).await?;
+        let subscription_id = handle.id().to_string();
 
         self.runtime
             .transition(
@@ -60,10 +61,7 @@ impl BlockStream {
         let mut idle_intervals = 0_usize;
 
         loop {
-            let payload = match timeout(
-                timeout_window,
-                session.next_subscription_payload(&subscription_id),
-            )
+            let payload = match timeout(timeout_window, handle.next_payload(self.name()))
             .await
             {
                 Ok(result) => {
@@ -115,7 +113,13 @@ impl BlockStream {
                 ),
             };
 
-            send_event(sender, Event::Block(raw.to_block(metadata))).await?;
+            let block_event = raw.to_block(metadata);
+            observability::record_ingest_event(
+                self.name(),
+                crate::stream::channel_label(self.channel()),
+                crate::stream::decode_status_label(block_event.metadata.decode_status),
+            );
+            send_event(sender, Event::Block(block_event)).await?;
         }
     }
 }

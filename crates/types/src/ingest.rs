@@ -20,6 +20,10 @@ pub enum BlockContext {
 pub enum Channel {
     Ipc,
     Ws,
+    /// Base Flashblocks pre-confirm websocket. Distinct from a generic JSON-RPC
+    /// websocket because the wire format is gzipped Flashblocks payloads, not
+    /// `eth_subscription` envelopes.
+    FlashblocksWs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +75,7 @@ pub enum RawMessageType {
     Transaction,
     Log,
     Block,
+    Flashblock,
     Heartbeat,
     Status,
     Unknown,
@@ -182,6 +187,27 @@ pub struct Block {
     pub timestamp_secs: Option<u64>,
 }
 
+/// Summary of a single Flashblocks pre-confirm sub-block.
+///
+/// Each Base block is split into ~5 Flashblocks delivered every ~200ms. This
+/// summary captures the metadata that is interesting to the decision/risk
+/// layers (parent block, sub-block index, the set of pre-confirmed tx hashes,
+/// and the count of receipts/logs the connector has already fanned out as
+/// individual `Event::Log` events with `BlockContext::Pending`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flashblock {
+    pub metadata: Metadata,
+    pub payload_id: Option<String>,
+    pub index: u64,
+    pub parent_block_number: Option<BlockNumber>,
+    pub parent_hash: Option<BlockHash>,
+    pub block_hash: Option<BlockHash>,
+    pub state_root: Option<String>,
+    pub gas_used: Option<u64>,
+    pub tx_hashes: Vec<TxHash>,
+    pub log_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heartbeat {
     /// Runtime heartbeat emitted by ingest to show the stream is still alive.
@@ -210,6 +236,7 @@ pub enum Event {
     Transaction(Transaction),
     Log(Log),
     Block(Block),
+    Flashblock(Flashblock),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

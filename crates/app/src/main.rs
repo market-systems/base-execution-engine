@@ -1,9 +1,15 @@
 use anyhow::Context;
-use config::{AppConfig, DecisionConfig};
+use config::{AppConfig, DecisionConfig, DiscoveryConfig};
 use decision::{
-    assess_risk, build_execution_request, detect_two_leg_loops_from_book,
-    simulate_two_leg_opportunity, SimulationConfig,
+    build_execution_request, detect_two_leg_loops_from_book, simulate_two_leg_opportunity,
+    RiskEngine, RiskPolicy, SimulationConfig,
 };
+use config::ExecutionMode;
+use discovery::{AlloyFactoryReader, DiscoveryService, FactoryConfig};
+use execution::gas::GasCaps;
+use execution::nonce::NonceManager;
+use execution::signer::load_signer;
+use execution::submit::AlloySubmitTransport;
 use execution::{
     build_submission_payload, finalize_from_receipt, mark_dropped, mark_submitted,
     prepare_execution, ExecutionTransport, UnavailableTransport,
@@ -11,8 +17,9 @@ use execution::{
 use ingest::IngestPipeline;
 use markets::{MarketEventOutcome, PoolBook, V2PoolState};
 use observability::ObservabilityRuntime;
-use rpc::RpcTopology;
+use rpc::{EngineProvider, RpcTopology};
 use serde::Deserialize;
+use std::sync::Arc;
 use storage::{DecisionRunRecord, Storage};
 use types::ingest::Event;
 use types::{Amount, Exchange, Protocol};
@@ -50,7 +57,20 @@ async fn main() -> anyhow::Result<()> {
         execution_mode = ?config.execution.mode,
         "engine runtime configured"
     );
-    let execution_transport = build_execution_transport();
+    let execution_transport = build_execution_transport(&rpc_topology, &config)
+        .await
+        .context("failed to build execution transport")?;
+
+    let risk_engine = std::sync::Arc::new(RiskEngine::new(
+        RiskPolicy::from_config(&config.risk).context("failed to build risk policy")?,
+    ));
+    tracing::info!(
+        min_net_profit_wei = %config.risk.min_net_profit_wei,
+        max_trade_notional = config.risk.max_trade_notional_wei.as_deref().unwrap_or("unbounded"),
+        max_daily_notional = config.risk.max_daily_notional_wei.as_deref().unwrap_or("unbounded"),
+        max_consecutive_reverts = config.risk.max_consecutive_reverts,
+        "risk engine initialised"
+    );
 
     let storage = Storage::connect(&config.storage)
         .await
@@ -59,7 +79,16 @@ async fn main() -> anyhow::Result<()> {
 
     let mut pool_book =
         load_pool_book(&config.decision).context("failed to bootstrap pool book")?;
-    tracing::info!(pool_count = pool_book.v2_pools().count(), "pool book ready");
+    if config.discovery.enabled {
+        run_pool_discovery(&config.discovery, &rpc_topology, &mut pool_book)
+            .await
+            .context("failed to run pool discovery")?;
+    }
+    tracing::info!(
+        v2_pool_count = pool_book.v2_pools().count(),
+        v3_pool_count = pool_book.v3_pools().count(),
+        "pool book ready"
+    );
 
     let runtime_scan_config = runtime_scan_config(&config.decision)?;
     if let Some(scan) = &runtime_scan_config {
@@ -92,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
                             &config,
                             &storage,
                             execution_transport.as_ref(),
+                            risk_engine.as_ref(),
                         )
                         .await
                         .context("failed to persist decision output")?;
@@ -130,6 +160,17 @@ async fn handle_event(
     let Event::Log(log) = event else {
         return Ok(None);
     };
+
+    // Decision-loop ingest lag = wall-clock from the connector observing
+    // this event to it being picked up here. Captures backpressure on the
+    // mpsc channel feeding the main loop and downstream blocking work.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(log.metadata.observed_at_ms);
+    let lag_ms = now_ms.saturating_sub(log.metadata.observed_at_ms);
+    observability::record_decision_lag("log_stream", lag_ms as f64 / 1000.0);
+
     let observed_log_id = storage
         .persist_observed_log(log)
         .await
@@ -155,6 +196,7 @@ async fn handle_event(
                 );
 
                 if let Some(best) = opportunities.first() {
+                    observability::record_opportunity_outcome("detected");
                     tracing::info!(
                         opportunity_id = %best.id,
                         opportunity_count = opportunities.len(),
@@ -163,8 +205,20 @@ async fn handle_event(
                         "detected two-leg opportunities after market update"
                     );
 
-                    let simulation = simulate_two_leg_opportunity(best, scan.simulation)
-                        .context("failed to simulate two-leg opportunity")?;
+                    let sim_started = std::time::Instant::now();
+                    let simulation_opt = simulate_two_leg_opportunity(best, scan.simulation);
+                    let sim_secs = sim_started.elapsed().as_secs_f64();
+                    let Some(simulation) = simulation_opt else {
+                        // Local simulator returned `None` (e.g. step rejected
+                        // by quote math, slippage out of band). Treat as a
+                        // skipped opportunity and bail out — this is the hot
+                        // path so we don't want to log loudly.
+                        observability::record_simulator_local(sim_secs, "rejected");
+                        observability::record_opportunity_outcome("skipped");
+                        return Ok(None);
+                    };
+                    observability::record_simulator_local(sim_secs, "ok");
+                    observability::record_opportunity_outcome("simulated");
                     return Ok(Some(DecisionPipelineOutput {
                         observed_log_id,
                         opportunity: best.clone(),
@@ -208,6 +262,62 @@ fn load_pool_book(config: &DecisionConfig) -> anyhow::Result<PoolBook> {
     Ok(book)
 }
 
+/// Run a one-shot factory scan + multicall hydration pass and inject the
+/// discovered pools into `book`. Errors are propagated to the caller; this
+/// function is invoked only when `DISCOVERY_ENABLED=true`.
+async fn run_pool_discovery(
+    config: &DiscoveryConfig,
+    rpc_topology: &RpcTopology,
+    book: &mut PoolBook,
+) -> anyhow::Result<()> {
+    let factories_path = config
+        .factories_path
+        .as_ref()
+        .context("DISCOVERY_FACTORIES_PATH must be set when discovery is enabled")?;
+    let multicall3 = config
+        .multicall3_address
+        .as_ref()
+        .context("DISCOVERY_MULTICALL3_ADDRESS must be set when discovery is enabled")?;
+
+    let raw = std::fs::read_to_string(factories_path)
+        .with_context(|| format!("failed to read factories file `{factories_path}`"))?;
+    let factories: Vec<FactoryConfig> = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse factories file `{factories_path}`"))?;
+
+    let provider = EngineProvider::connect_http(rpc_topology)
+        .context("failed to connect HTTP rpc provider for discovery")?;
+    provider
+        .verify_chain_id()
+        .await
+        .context("rpc chain_id mismatch during discovery bootstrap")?;
+    let reader = Arc::new(AlloyFactoryReader::new(provider));
+    let mut service = DiscoveryService::new(reader, multicall3)
+        .context("failed to construct DiscoveryService")?;
+    if let Some(head) = config.pinned_head_block {
+        service = service.with_pinned_head(head);
+    }
+
+    for factory in &factories {
+        match service.run_factory(factory, book).await {
+            Ok(report) => tracing::info!(
+                factory_address = %report.factory_address,
+                kind = ?report.kind,
+                from_block = report.from_block,
+                to_block = report.to_block,
+                pools_scanned = report.pools_scanned,
+                pools_inserted = report.pools_inserted,
+                "factory discovery complete"
+            ),
+            Err(err) => tracing::error!(
+                factory_address = %factory.address,
+                error = %err,
+                "factory discovery failed; continuing with remaining factories"
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn runtime_scan_config(config: &DecisionConfig) -> anyhow::Result<Option<RuntimeScanConfig>> {
     let (Some(settlement_token), Some(amount)) =
         (&config.settlement_token, &config.scan_trade_amount_wei)
@@ -238,17 +348,13 @@ async fn maybe_log_decision_output(
     app_config: &AppConfig,
     storage: &Storage,
     execution_transport: &dyn ExecutionTransport,
+    risk_engine: &RiskEngine,
 ) -> anyhow::Result<()> {
     let Some(output) = output else {
         return Ok(());
     };
 
-    let risk = assess_risk(
-        &output.opportunity,
-        &output.simulation,
-        &app_config.decision,
-    )
-    .context("failed to assess risk for opportunity")?;
+    let risk = risk_engine.assess(&output.opportunity, &output.simulation);
 
     tracing::info!(
         opportunity_id = %output.opportunity.id,
@@ -256,6 +362,7 @@ async fn maybe_log_decision_output(
         gas_cost_wei = %output.simulation.gas_cost_wei,
         l1_data_fee = %output.simulation.l1_data_fee,
         risk_accepted = risk.accepted,
+        risk_reason = risk.reason.as_deref().unwrap_or(""),
         "completed decision simulation and risk assessment"
     );
 
@@ -309,6 +416,55 @@ async fn maybe_log_decision_output(
             .await?;
 
         if prepared_execution.should_submit {
+            // Slow-path eth_call validation: replay the same calldata against
+            // the live router. Cheap local sims miss things like router
+            // pause, allowance drift, or tax/honeypot tokens that only show
+            // up at execution time.
+            let payload_for_sim = build_submission_payload(&app_config.execution, request)
+                .context("failed to build submission payload for eth_call simulation")?;
+            let sim_outcome = run_ethcall_simulation(
+                execution_transport,
+                &payload_for_sim,
+                &prepared_execution.attempt,
+                app_config,
+            )
+            .await;
+
+            match sim_outcome {
+                Ok(simulation) => {
+                    tracing::info!(
+                        request_id = %request.opportunity_id,
+                        outcome = ?simulation,
+                        "eth_call slow-path simulation completed"
+                    );
+                }
+                Err(error) if app_config.execution.ethcall_preflight_required => {
+                    tracing::warn!(
+                        request_id = %request.opportunity_id,
+                        error = %error,
+                        "eth_call slow-path simulation failed; aborting submission"
+                    );
+                    risk_engine.record_outcome(false);
+                    if let Some(execution_attempt_id) = execution_attempt_id {
+                        storage
+                            .record_execution_attempt_error(
+                                execution_attempt_id,
+                                "ethcall_simulate",
+                                &error.to_string(),
+                            )
+                            .await?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %request.opportunity_id,
+                        error = %error,
+                        "eth_call slow-path simulation failed but is configured as advisory; submitting anyway"
+                    );
+                }
+            }
+
             drive_execution_attempt(
                 execution_transport,
                 request,
@@ -316,6 +472,7 @@ async fn maybe_log_decision_output(
                 app_config,
                 storage,
                 execution_attempt_id,
+                risk_engine,
             )
             .await
             .context("failed to drive execution attempt lifecycle")?;
@@ -325,10 +482,94 @@ async fn maybe_log_decision_output(
     Ok(())
 }
 
-fn build_execution_transport() -> Box<dyn ExecutionTransport> {
-    Box::new(UnavailableTransport::new(
-        "execution submitter is not configured yet; signer, calldata builder, and RPC submit path are still pending",
-    ))
+/// Pick the execution transport for the configured mode.
+///
+/// - `Shadow`: returns the placeholder transport so the engine can run a
+///   passive observation loop without holding a signer or RPC handle.
+/// - `Canary` / `Live`: builds the alloy-backed transport; requires a working
+///   HTTP RPC, a signer source, and a deployed router address. Bails fast on
+///   any of those being absent.
+async fn build_execution_transport(
+    topology: &RpcTopology,
+    config: &AppConfig,
+) -> anyhow::Result<Box<dyn ExecutionTransport>> {
+    if config.execution.mode == ExecutionMode::Shadow {
+        return Ok(Box::new(UnavailableTransport::new(
+            "shadow mode: submission disabled by configuration",
+        )));
+    }
+
+    if topology.first_http().is_none() {
+        anyhow::bail!(
+            "execution mode `{:?}` requires a HTTP RPC endpoint; set INGEST_HTTP_URL or its alias",
+            config.execution.mode
+        );
+    }
+
+    let provider = EngineProvider::connect_http(topology)
+        .context("failed to connect HTTP rpc provider")?;
+    provider
+        .verify_chain_id()
+        .await
+        .context("rpc chain id verification failed during bootstrap")?;
+
+    let signer = load_signer(&config.signer, topology.chain_id)
+        .context("failed to load signer for execution transport")?;
+    tracing::info!(
+        signer_address = ?signer.address(),
+        chain_id = topology.chain_id,
+        "engine signer loaded"
+    );
+
+    let nonce = NonceManager::new();
+    let initial_nonce = nonce
+        .sync_from_chain(&provider, signer.address())
+        .await
+        .context("failed to initialise signer nonce from chain")?;
+    tracing::info!(initial_nonce, "nonce manager primed from chain");
+
+    let caps = GasCaps::from_config(&config.execution)
+        .context("invalid gas cap configuration")?;
+
+    let transport = AlloySubmitTransport::new(provider, signer, nonce, caps);
+    Ok(Box::new(transport))
+}
+
+/// Run the slow-path `eth_call` simulation with a hard timeout. Wrapping in
+/// `tokio::time::timeout` keeps a misbehaving RPC node from stalling the
+/// pipeline indefinitely; if the timeout fires we treat it as a simulation
+/// failure so the caller can apply the configured strict/advisory policy.
+async fn run_ethcall_simulation(
+    transport: &dyn ExecutionTransport,
+    payload: &execution::SubmissionPayload,
+    attempt: &types::execution::ExecutionAttempt,
+    app_config: &AppConfig,
+) -> anyhow::Result<execution::EthCallSimulation> {
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(app_config.execution.ethcall_timeout_secs),
+        transport.simulate(payload, attempt),
+    )
+    .await;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    match result {
+        Ok(Ok(outcome)) => {
+            observability::record_simulator_ethcall(elapsed, "ok");
+            Ok(outcome)
+        }
+        Ok(Err(error)) => {
+            observability::record_simulator_ethcall(elapsed, "reverted");
+            Err(error)
+        }
+        Err(_) => {
+            observability::record_simulator_ethcall(elapsed, "timeout");
+            Err(anyhow::anyhow!(
+                "eth_call simulation timed out after {}s",
+                app_config.execution.ethcall_timeout_secs
+            ))
+        }
+    }
 }
 
 async fn drive_execution_attempt(
@@ -338,6 +579,7 @@ async fn drive_execution_attempt(
     app_config: &AppConfig,
     storage: &Storage,
     execution_attempt_id: Option<i64>,
+    risk_engine: &RiskEngine,
 ) -> anyhow::Result<()> {
     let submission_payload = match build_submission_payload(&app_config.execution, request) {
         Ok(payload) => payload,
@@ -373,6 +615,12 @@ async fn drive_execution_attempt(
                 error = %error,
                 "execution submission failed"
             );
+            observability::record_execution_outcome("submit_failed");
+            // Submission failures count as reverts for the circuit breaker:
+            // they consumed a decision slot and possibly a nonce, and the most
+            // common cause (RPC reject, preflight revert) usually repeats on
+            // the next attempt.
+            risk_engine.record_outcome(false);
             if let Some(execution_attempt_id) = execution_attempt_id {
                 storage
                     .record_execution_attempt_error(
@@ -390,6 +638,8 @@ async fn drive_execution_attempt(
                 error = %error,
                 "execution submission timed out"
             );
+            observability::record_execution_outcome("submit_timeout");
+            risk_engine.record_outcome(false);
             if let Some(execution_attempt_id) = execution_attempt_id {
                 storage
                     .record_execution_attempt_error(
@@ -405,6 +655,7 @@ async fn drive_execution_attempt(
 
     let submitted_attempt =
         mark_submitted(built_attempt, submitted_tx_hash).context("invalid submitted attempt")?;
+    observability::record_execution_outcome("submitted");
     if let Some(execution_attempt_id) = execution_attempt_id {
         storage
             .mark_execution_submitted(execution_attempt_id, &submitted_attempt)
@@ -436,6 +687,26 @@ async fn drive_execution_attempt(
                 "execution finalized from receipt"
             );
 
+            observability::record_execution_outcome(execution_status_label(
+                finalized.outcome.final_status,
+            ));
+
+            // PnL emit: surplus may be missing (e.g. revert) — fall back to
+            // -fee so the cumulative gauge captures the real net cost.
+            let fee_paid_wei = finalized.outcome.total_fee_paid.unwrap_or(0);
+            let surplus_wei: i128 = match finalized.outcome.realized_surplus {
+                Some(value) => value as i128,
+                None => -(fee_paid_wei as i128),
+            };
+            observability::record_realized_pnl(surplus_wei, fee_paid_wei);
+
+            let outcome_success = matches!(
+                finalized.outcome.final_status,
+                types::execution::ExecutionStatus::Included
+                    | types::execution::ExecutionStatus::ProfitRealized
+            );
+            risk_engine.record_outcome(outcome_success);
+
             if let Some(execution_attempt_id) = execution_attempt_id {
                 storage
                     .finalize_execution_attempt(
@@ -458,6 +729,11 @@ async fn drive_execution_attempt(
                 tx_hash = dropped.outcome.tx_hash,
                 "execution receipt did not arrive before timeout; marked dropped"
             );
+            observability::record_execution_outcome("dropped");
+            // Dropped tx ≠ revert, but it still uses up a nonce window and is
+            // a strong signal something is wrong (mempool eviction, sequencer
+            // outage). Treat it as a soft revert for breaker purposes.
+            risk_engine.record_outcome(false);
             if let Some(execution_attempt_id) = execution_attempt_id {
                 storage
                     .finalize_execution_attempt_without_receipt(
@@ -475,6 +751,10 @@ async fn drive_execution_attempt(
                 error = %error,
                 "execution receipt lookup failed; attempt remains submitted pending"
             );
+            // Receipt lookup failure leaves the tx in an unknown state. Bucket
+            // it under a distinct label so dashboards can distinguish RPC
+            // flakiness from real on-chain reverts.
+            observability::record_execution_outcome("receipt_unknown");
             if let Some(execution_attempt_id) = execution_attempt_id {
                 storage
                     .record_execution_attempt_error(
@@ -488,4 +768,19 @@ async fn drive_execution_attempt(
     }
 
     Ok(())
+}
+
+/// Map an [`ExecutionStatus`] onto its bounded Prometheus label. We intentionally
+/// keep this list closed: a new variant requires adding a label here, which
+/// keeps the cardinality of `execution_outcomes_total` predictable.
+fn execution_status_label(status: types::execution::ExecutionStatus) -> &'static str {
+    match status {
+        types::execution::ExecutionStatus::Built => "built",
+        types::execution::ExecutionStatus::Submitted => "submitted",
+        types::execution::ExecutionStatus::Included => "included",
+        types::execution::ExecutionStatus::Reverted => "reverted",
+        types::execution::ExecutionStatus::Dropped => "dropped",
+        types::execution::ExecutionStatus::Replaced => "replaced",
+        types::execution::ExecutionStatus::ProfitRealized => "profit_realized",
+    }
 }

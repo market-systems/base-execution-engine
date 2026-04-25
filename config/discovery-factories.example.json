@@ -1,0 +1,29 @@
+[
+  {
+    "address": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
+    "kind": "uniswap_v2",
+    "protocol": "uniswap_v2",
+    "exchange": null,
+    "deployment_block": 6601915,
+    "default_v2_fee_bps": 30,
+    "log_chunk_size": 5000
+  },
+  {
+    "address": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+    "kind": "uniswap_v3",
+    "protocol": "uniswap_v3",
+    "exchange": null,
+    "deployment_block": 1371680,
+    "default_v2_fee_bps": null,
+    "log_chunk_size": 5000
+  },
+  {
+    "address": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
+    "kind": "uniswap_v2",
+    "protocol": "aerodrome",
+    "exchange": "aerodrome",
+    "deployment_block": 3200559,
+    "default_v2_fee_bps": 30,
+    "log_chunk_size": 5000
+  }
+]

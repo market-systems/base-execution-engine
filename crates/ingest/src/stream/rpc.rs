@@ -1,259 +1,167 @@
-use super::StreamSubscription;
+//! Alloy pubsub session.
+//!
+//! This module replaces the previous hand-rolled tungstenite + Unix-socket
+//! transport with `alloy-provider`'s pubsub frontend. The trade-offs:
+//!
+//! - **Wire compatibility**: alloy-pubsub speaks the same JSON-RPC dialect
+//!   the streams rely on, so we do not need to rewrite the downstream
+//!   `RawLogMessage` / `RawTransactionMessage` / `RawBlockMessage`
+//!   decoders. Each subscription item is serialised back to
+//!   [`serde_json::Value`] before being handed off, which is essentially
+//!   free compared to the network round-trip.
+//! - **Subscription multiplexing**: alloy maintains a single backend
+//!   connection per provider with channel fan-out, so we no longer need
+//!   the manual "queued subscription payloads" buffer the old session
+//!   carried for re-entrant `request` calls during a `subscribe` flow.
+//! - **Pending transaction shape**: alloy's typed
+//!   `subscribe_pending_transactions()` always returns hashes (`B256`),
+//!   never the Geth-only `["newPendingTransactions", true]` full-tx form.
+//!   That is a strict portability win and the existing `materialize_*`
+//!   step in `transaction.rs` already knows to follow up with
+//!   `eth_getTransactionByHash`, so the on-the-wire behaviour is identical
+//!   for the consumers downstream.
+
 use crate::channel::IngestEndpoint;
 use crate::error::IngestError;
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
-use std::collections::VecDeque;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use crate::stream::StreamSubscription;
+use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_pubsub::PubSubFrontend;
+use alloy_rpc_types_eth::Filter;
+use alloy_transport_ipc::IpcConnect;
+use alloy_transport_ws::WsConnect;
+use futures_util::{Stream, StreamExt};
+use serde_json::Value;
+use std::pin::Pin;
 
-pub(crate) struct JsonRpcSession {
-    connection: JsonRpcConnection,
-    next_request_id: u64,
-    queued_subscription_payloads: VecDeque<Value>,
+pub(crate) struct AlloyPubsubSession {
+    provider: RootProvider<PubSubFrontend>,
     stream_name: &'static str,
 }
 
-impl JsonRpcSession {
+impl AlloyPubsubSession {
     pub(crate) async fn connect(
         endpoint: &IngestEndpoint,
         stream_name: &'static str,
     ) -> Result<Self, IngestError> {
-        Ok(Self {
-            connection: JsonRpcConnection::open(endpoint).await?,
-            next_request_id: 1,
-            queued_subscription_payloads: VecDeque::new(),
-            stream_name,
-        })
-    }
-
-    pub(crate) async fn subscribe(
-        &mut self,
-        subscription: StreamSubscription,
-    ) -> Result<String, IngestError> {
-        let params = match subscription {
-            StreamSubscription::Transactions => json!(["newPendingTransactions", true]),
-            StreamSubscription::Logs => json!(["logs", {}]),
-            StreamSubscription::Blocks => json!(["newHeads"]),
-        };
-
-        let response = self.request("eth_subscribe", params).await?;
-        response
-            .as_str()
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| IngestError::JsonRpc {
-                stream_name: self.stream_name,
-                message: "subscription response did not return a subscription id".to_string(),
-            })
-    }
-
-    pub(crate) async fn request(
-        &mut self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, IngestError> {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-
-        self.connection
-            .send_json(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
-            .await?;
-
-        loop {
-            let message = self.connection.next_json(self.stream_name).await?;
-
-            if let Some(payload) = try_extract_subscription_payload(&message, None)? {
-                self.queued_subscription_payloads.push_back(payload);
-                continue;
-            }
-
-            let Some(message_id) = message.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-
-            if message_id == id {
-                return extract_result(self.stream_name, &message);
-            }
-        }
-    }
-
-    pub(crate) async fn next_subscription_payload(
-        &mut self,
-        subscription_id: &str,
-    ) -> Result<Value, IngestError> {
-        if let Some(payload) = self.queued_subscription_payloads.pop_front() {
-            return Ok(payload);
-        }
-
-        loop {
-            let message = self.connection.next_json(self.stream_name).await?;
-
-            if let Some(payload) =
-                try_extract_subscription_payload(&message, Some(subscription_id))?
-            {
-                return Ok(payload);
-            }
-        }
-    }
-}
-
-enum JsonRpcConnection {
-    Ws(WebSocketStream<MaybeTlsStream<TcpStream>>),
-    Ipc(IpcConnection),
-}
-
-impl JsonRpcConnection {
-    async fn open(endpoint: &IngestEndpoint) -> Result<Self, IngestError> {
-        match endpoint {
+        let provider: RootProvider<PubSubFrontend> = match endpoint {
             IngestEndpoint::Ws { url } => {
-                let (stream, _) = connect_async(url).await?;
-                Ok(Self::Ws(stream))
+                let connect = WsConnect::new(url.clone());
+                ProviderBuilder::new().on_ws(connect).await?
             }
             IngestEndpoint::Ipc { file_path } => {
-                let stream = UnixStream::connect(file_path).await?;
-                Ok(Self::Ipc(IpcConnection {
-                    stream,
-                    read_buffer: Vec::with_capacity(4096),
-                }))
+                let connect = IpcConnect::new(file_path.clone());
+                ProviderBuilder::new().on_ipc(connect).await?
             }
-        }
-    }
-
-    async fn send_json(&mut self, value: &Value) -> Result<(), IngestError> {
-        match self {
-            Self::Ws(stream) => {
-                stream.send(Message::Text(value.to_string())).await?;
-                Ok(())
-            }
-            Self::Ipc(connection) => connection.send_json(value).await,
-        }
-    }
-
-    async fn next_json(&mut self, stream_name: &'static str) -> Result<Value, IngestError> {
-        match self {
-            Self::Ws(stream) => loop {
-                let Some(message) = stream.next().await else {
-                    return Err(IngestError::StreamFailure {
-                        stream_name,
-                        message: "websocket connection closed".to_string(),
-                    });
-                };
-
-                match message? {
-                    Message::Text(text) => return Ok(serde_json::from_str(&text)?),
-                    Message::Binary(bytes) => return Ok(serde_json::from_slice(&bytes)?),
-                    Message::Ping(payload) => stream.send(Message::Pong(payload)).await?,
-                    Message::Pong(_) | Message::Frame(_) => continue,
-                    Message::Close(frame) => {
-                        return Err(IngestError::StreamFailure {
-                            stream_name,
-                            message: format!("websocket closed: {frame:?}"),
-                        });
-                    }
-                }
-            },
-            Self::Ipc(connection) => connection.next_json(stream_name).await,
-        }
-    }
-}
-
-struct IpcConnection {
-    stream: UnixStream,
-    read_buffer: Vec<u8>,
-}
-
-impl IpcConnection {
-    async fn send_json(&mut self, value: &Value) -> Result<(), IngestError> {
-        self.stream.write_all(value.to_string().as_bytes()).await?;
-        Ok(())
-    }
-
-    async fn next_json(&mut self, stream_name: &'static str) -> Result<Value, IngestError> {
-        loop {
-            if let Some((value, consumed)) = try_parse_json(&self.read_buffer)? {
-                self.read_buffer.drain(..consumed);
-                return Ok(value);
-            }
-
-            let mut chunk = vec![0_u8; 4096];
-            let read = self.stream.read(&mut chunk).await?;
-
-            if read == 0 {
-                return Err(IngestError::StreamFailure {
-                    stream_name,
-                    message: "ipc connection closed".to_string(),
-                });
-            }
-
-            self.read_buffer.extend_from_slice(&chunk[..read]);
-        }
-    }
-}
-
-fn try_parse_json(buffer: &[u8]) -> Result<Option<(Value, usize)>, IngestError> {
-    let mut stream = serde_json::Deserializer::from_slice(buffer).into_iter::<Value>();
-
-    match stream.next() {
-        Some(Ok(value)) => Ok(Some((value, stream.byte_offset()))),
-        Some(Err(error)) if error.is_eof() => Ok(None),
-        Some(Err(error)) => Err(error.into()),
-        None => Ok(None),
-    }
-}
-
-fn extract_result(stream_name: &'static str, message: &Value) -> Result<Value, IngestError> {
-    if let Some(error) = message.get("error") {
-        return Err(IngestError::JsonRpc {
+        };
+        Ok(Self {
+            provider,
             stream_name,
-            message: error.to_string(),
-        });
-    }
-
-    message
-        .get("result")
-        .cloned()
-        .ok_or_else(|| IngestError::JsonRpc {
-            stream_name,
-            message: "missing `result` field in json-rpc response".to_string(),
         })
-}
-
-fn try_extract_subscription_payload(
-    message: &Value,
-    subscription_id: Option<&str>,
-) -> Result<Option<Value>, IngestError> {
-    if message.get("method").and_then(Value::as_str) != Some("eth_subscription") {
-        return Ok(None);
     }
 
-    let params = message
-        .get("params")
-        .and_then(Value::as_object)
-        .ok_or_else(|| IngestError::JsonRpc {
-            stream_name: "json_rpc_session",
-            message: "subscription notification missing params object".to_string(),
-        })?;
-
-    let message_subscription = params
-        .get("subscription")
-        .and_then(Value::as_str)
-        .ok_or_else(|| IngestError::JsonRpc {
-            stream_name: "json_rpc_session",
-            message: "subscription notification missing subscription id".to_string(),
-        })?;
-
-    if let Some(expected) = subscription_id {
-        if message_subscription != expected {
-            return Ok(None);
+    /// Open a subscription. Returns a [`SubscriptionHandle`] that exposes a
+    /// JSON-shaped stream of payloads aligned with what the legacy
+    /// `JsonRpcSession::next_subscription_payload` returned, so the per-stream
+    /// decoders need no changes.
+    pub(crate) async fn subscribe(
+        &self,
+        subscription: StreamSubscription,
+    ) -> Result<SubscriptionHandle, IngestError> {
+        match subscription {
+            StreamSubscription::Logs => {
+                let sub = self.provider.subscribe_logs(&Filter::new()).await?;
+                let id = format!("{:#x}", sub.local_id());
+                let stream = sub.into_stream().map(|log| {
+                    serde_json::to_value(log).map_err(IngestError::from)
+                });
+                Ok(SubscriptionHandle {
+                    id,
+                    stream: Box::pin(stream),
+                })
+            }
+            StreamSubscription::Blocks => {
+                let sub = self.provider.subscribe_blocks().await?;
+                let id = format!("{:#x}", sub.local_id());
+                let stream = sub.into_stream().map(|header| {
+                    serde_json::to_value(header).map_err(IngestError::from)
+                });
+                Ok(SubscriptionHandle {
+                    id,
+                    stream: Box::pin(stream),
+                })
+            }
+            StreamSubscription::Transactions => {
+                let sub = self.provider.subscribe_pending_transactions().await?;
+                let id = format!("{:#x}", sub.local_id());
+                let stream = sub.into_stream().map(|hash| {
+                    // Hashes serialise to `"0x..."` strings, which the
+                    // transaction stream's `materialize_transaction` step
+                    // then expands via `eth_getTransactionByHash`.
+                    serde_json::to_value(hash).map_err(IngestError::from)
+                });
+                Ok(SubscriptionHandle {
+                    id,
+                    stream: Box::pin(stream),
+                })
+            }
         }
     }
 
-    Ok(Some(params.get("result").cloned().unwrap_or(Value::Null)))
+    /// Generic JSON-RPC call. Mirrors the legacy session's `request` method
+    /// so the per-stream code that materialises pending transactions does
+    /// not need to know which transport is underneath.
+    pub(crate) async fn request(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, IngestError> {
+        // Deserialise the params into a `Vec<Value>` shaped tuple via
+        // alloy_json_rpc by converting through its dynamic param type.
+        let result: Value = self
+            .provider
+            .client()
+            .request(method, params)
+            .await
+            .map_err(|e| IngestError::JsonRpc {
+                stream_name: self.stream_name,
+                message: e.to_string(),
+            })?;
+        Ok(result)
+    }
+}
+
+/// A live subscription. Drops the underlying alloy `Subscription` when
+/// dropped; the alloy frontend then sends the matching `eth_unsubscribe`
+/// best-effort. Treat this handle as `!Sync` even though the trait bounds
+/// would allow it: the inner stream is `!Send` across `&mut` boundaries.
+pub(crate) struct SubscriptionHandle {
+    id: String,
+    stream: Pin<Box<dyn Stream<Item = Result<Value, IngestError>> + Send>>,
+}
+
+impl SubscriptionHandle {
+    /// Subscription id reported by the upstream node. Used purely for
+    /// observability/log lines today; the alloy frontend tracks the
+    /// subscription internally so we do not need to pass the id back when
+    /// pulling new payloads.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Pull the next payload. Returns `Err(StreamFailure)` when the upstream
+    /// stream has closed, which the per-stream layer translates into a
+    /// reconnect via its standard backoff loop.
+    pub(crate) async fn next_payload(
+        &mut self,
+        stream_name: &'static str,
+    ) -> Result<Value, IngestError> {
+        match self.stream.next().await {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(err)) => Err(err),
+            None => Err(IngestError::StreamFailure {
+                stream_name,
+                message: "alloy subscription stream closed".to_string(),
+            }),
+        }
+    }
 }

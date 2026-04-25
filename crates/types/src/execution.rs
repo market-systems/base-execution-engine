@@ -24,6 +24,10 @@ pub struct ExecutionStep {
     pub amount_in: Option<Amount>,
     pub min_amount_out: Amount,
     pub calldata_hint: Option<String>,
+    /// Auxiliary venue parameter consumed by the calldata builder, e.g. the
+    /// Aerodrome factory address that selects the pool kind on a Solidly fork.
+    #[serde(default)]
+    pub aux_address: Option<Address>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

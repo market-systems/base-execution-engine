@@ -1,6 +1,6 @@
 use crate::error::IngestError;
 use crate::raw::RawTransactionMessage;
-use crate::stream::rpc::JsonRpcSession;
+use crate::stream::rpc::AlloyPubsubSession;
 use crate::stream::{
     current_time_ms, decode_status, emit_heartbeat, payload_size_bytes, raw_summary, send_event,
     EventSender, IngestStream, IngestStreamContext, RuntimeEventSender, StreamRuntime,
@@ -36,7 +36,7 @@ impl TransactionStream {
         sender: &EventSender,
         runtime_sender: &RuntimeEventSender,
     ) -> Result<(), IngestError> {
-        let mut session = JsonRpcSession::connect(self.context.endpoint(), self.name()).await?;
+        let session = AlloyPubsubSession::connect(self.context.endpoint(), self.name()).await?;
 
         self.runtime
             .transition(
@@ -47,7 +47,8 @@ impl TransactionStream {
             )
             .await?;
 
-        let subscription_id = session.subscribe(self.subscription()).await?;
+        let mut handle = session.subscribe(self.subscription()).await?;
+        let subscription_id = handle.id().to_string();
 
         self.runtime
             .transition(
@@ -62,10 +63,7 @@ impl TransactionStream {
         let mut idle_intervals = 0_usize;
 
         loop {
-            let payload = match timeout(
-                timeout_window,
-                session.next_subscription_payload(&subscription_id),
-            )
+            let payload = match timeout(timeout_window, handle.next_payload(self.name()))
             .await
             {
                 Ok(result) => {
@@ -96,7 +94,7 @@ impl TransactionStream {
                 }
             };
 
-            let materialized = self.materialize_transaction(&mut session, payload).await?;
+            let materialized = self.materialize_transaction(&session, payload).await?;
             if materialized.is_null() {
                 continue;
             }
@@ -127,13 +125,19 @@ impl TransactionStream {
                 ),
             };
 
-            send_event(sender, Event::Transaction(raw.to_transaction(metadata))).await?;
+            let tx_event = raw.to_transaction(metadata);
+            observability::record_ingest_event(
+                self.name(),
+                crate::stream::channel_label(self.channel()),
+                crate::stream::decode_status_label(tx_event.metadata.decode_status),
+            );
+            send_event(sender, Event::Transaction(tx_event)).await?;
         }
     }
 
     async fn materialize_transaction(
         &self,
-        session: &mut JsonRpcSession,
+        session: &AlloyPubsubSession,
         payload: Value,
     ) -> Result<Value, IngestError> {
         let Some(tx_hash) = payload.as_str() else {

@@ -2,6 +2,14 @@
 
 //! Tracing, metrics, and health checks.
 
+pub mod metrics;
+
+pub use metrics::{
+    record_decision_lag, record_execution_outcome, record_ingest_event, record_opportunity_outcome,
+    record_realized_pnl, record_receipt_latency, record_simulator_ethcall, record_simulator_local,
+    record_submit_latency, register_business_metrics,
+};
+
 use anyhow::Context;
 use config::MetricsConfig;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -32,6 +40,10 @@ impl ObservabilityRuntime {
                     .context("failed to install prometheus recorder")?;
                 tracing::info!(%addr, "prometheus exporter listening");
             }
+            // Always register descriptions when metrics are enabled, even if
+            // no Prometheus listener is configured (some deployments rely on
+            // pull-from-pushgateway or just the recorder snapshot for tests).
+            register_business_metrics();
         }
 
         let (shutdown_healthz, healthz_shutdown_rx) = oneshot::channel();
