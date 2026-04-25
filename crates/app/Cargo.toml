@@ -6,14 +6,18 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-common = { path = "../common" }
 config = { path = "../config" }
-decode = { path = "../decode" }
-graph = { path = "../graph" }
-ingress = { path = "../ingress" }
-simulation = { path = "../simulation" }
-strategy = { path = "../strategy" }
-ethers.workspace = true
+decision = { path = "../decision" }
+discovery = { path = "../discovery" }
+execution = { path = "../execution" }
+ingest = { path = "../ingest" }
+markets = { path = "../markets" }
+observability = { path = "../observability" }
+rpc = { path = "../rpc" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+storage = { path = "../storage" }
+types = { path = "../types" }
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true

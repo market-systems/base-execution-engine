@@ -1,0 +1,22 @@
+[package]
+name = "discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace = true
+alloy-transport-http.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+markets = { path = "../markets" }
+reqwest.workspace = true
+rpc = { path = "../rpc" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+types = { path = "../types" }
