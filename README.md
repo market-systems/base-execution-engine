@@ -6,17 +6,6 @@ opportunities, runs risk + simulation, and submits atomic multi-venue
 arbitrage transactions through a self-deployed router that supports Balancer
 V2 flash loans, UniswapV2, UniswapV3, and Aerodrome V2 venues.
 
-Repository planning docs:
-
-- [Production roadmap](docs/PROD_READY_BASE_ARBITRAGE_ROADMAP.md)
-- [Implementation checklist](docs/IMPLEMENTATION_CHECKLIST.md)
-
-Useful config examples:
-
-- [Base liquidity seeds](config/base-liquidity-seeds.example.json)
-- [V2 bootstrap pools](config/v2-pool-bootstrap.example.json)
-- [Discovery factories](config/discovery-factories.example.json)
-
 ## Scope
 
 The system is built for execution workloads that depend on both
@@ -346,28 +335,6 @@ run with a fork URL:
 ```bash
 forge test --root contracts --fork-url $BASE_RPC_URL
 ```
-
-## Roadmap & Status
-
-Current phase completion (see
-[`docs/PROD_READY_BASE_ARBITRAGE_ROADMAP.md`](docs/PROD_READY_BASE_ARBITRAGE_ROADMAP.md)
-for the long-form plan):
-
-- ✅ Phase 0: ingest migrated to `alloy-pubsub` + Flashblocks connector
-- ✅ Phase 1: V3 tick math + factory-driven pool discovery
-- ✅ Phase 3: risk engine + slow-path eth_call + V2 calldata builder
-- ✅ Phase 4: signer / nonce / EIP-1559 gas / submit transport / receipt
-- ✅ Phase 5.1–5.4: router rewrite + Balancer flashloan + Foundry unit tests
-- ✅ Phase 6: 12 business metrics wired through `metrics!`
-- ⏳ Phase 5.5: Base mainnet fork test (requires `BASE_RPC_URL`)
-
-Suggested follow-ups not yet on the todo list:
-
-- sequencer-priority submission path with HTTP fallback
-- active drop/replace (cancel + same-nonce resubmit) on receipt timeout
-- L1 fee read via Base `GasPriceOracle` for accurate PnL accounting
-- three-leg / multi-hop opportunity detection
-- private mempool integration (Flashbots Protect / MEV-Share / Base bundle)
 
 ## License & Disclaimer
 
